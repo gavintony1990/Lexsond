@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe.ai/schemas/workflow-event-v1alpha1.json",
+  "title": "WorkflowEvent",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "run_id",
+    "sequence",
+    "event_type",
+    "phase",
+    "occurred_at",
+    "event_id",
+    "workflow_input_sha256",
+    "activity_name",
+    "attempt",
+    "idempotency_key",
+    "outcome_status",
+    "result_ref",
+    "failure_kind",
+    "error_code",
+    "retryable",
+    "retry_scheduled",
+    "retry_after_seconds",
+    "api_version"
+  ],
+  "properties": {
+    "run_id": { "type": "string", "format": "uuid" },
+    "sequence": { "type": "integer", "minimum": 1 },
+    "event_type": {
+      "enum": [
+        "WORKFLOW_STARTED",
+        "ACTIVITY_STARTED",
+        "ACTIVITY_ATTEMPT_FAILED",
+        "ACTIVITY_COMPLETED",
+        "WORKFLOW_SUCCEEDED",
+        "WORKFLOW_FAILED",
+        "WORKFLOW_REJECTED",
+        "WORKFLOW_CANCELLED"
+      ]
+    },
+    "phase": {
+      "enum": [
+        "NONE",
+        "VALIDATE",
+        "PREFLIGHT",
+        "EXECUTE",
+        "NORMALIZE",
+        "SCORE",
+        "PERSIST",
+        "COMPARE",
+        "NOTIFY",
+        "COMPLETE"
+      ]
+    },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "event_id": { "type": "string", "format": "uuid" },
+    "workflow_input_sha256": {
+      "type": ["string", "null"],
+      "pattern": "^[A-Fa-f0-9]{64}$"
+    },
+    "activity_name": {
+      "type": ["string", "null"],
+      "enum": [
+        "validate_config",
+        "preflight_endpoint",
+        "execute_native_probe",
+        "normalize_measurements",
+        "compute_dimension_scores",
+        "persist_result",
+        "compare_slo",
+        "notify_state_change",
+        null
+      ]
+    },
+    "attempt": { "type": ["integer", "null"], "minimum": 1 },
+    "idempotency_key": { "type": ["string", "null"], "minLength": 1 },
+    "outcome_status": {
+      "type": ["string", "null"],
+      "enum": ["SUCCEEDED", "TARGET_FAILED", null]
+    },
+    "result_ref": { "type": ["string", "null"], "minLength": 1 },
+    "failure_kind": {
+      "type": ["string", "null"],
+      "enum": ["CONFIGURATION", "POLICY", "INFRASTRUCTURE", "RUNNER", null]
+    },
+    "error_code": {
+      "type": ["string", "null"],
+      "pattern": "^[A-Z][A-Z0-9_]{2,127}$"
+    },
+    "retryable": { "type": ["boolean", "null"] },
+    "retry_scheduled": { "type": ["boolean", "null"] },
+    "retry_after_seconds": { "type": ["number", "null"], "minimum": 0 },
+    "api_version": { "const": "probe.ai/workflow/v1alpha1" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "event_type": { "const": "WORKFLOW_STARTED" } } },
+      "then": {
+        "properties": {
+          "workflow_input_sha256": { "type": "string" },
+          "phase": { "const": "NONE" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "event_type": { "const": "ACTIVITY_STARTED" } } },
+      "then": {
+        "properties": {
+          "activity_name": { "type": "string" },
+          "attempt": { "type": "integer" },
+          "idempotency_key": { "type": "string" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "event_type": { "const": "ACTIVITY_ATTEMPT_FAILED" } }
+      },
+      "then": {
+        "properties": {
+          "activity_name": { "type": "string" },
+          "attempt": { "type": "integer" },
+          "failure_kind": { "type": "string" },
+          "error_code": { "type": "string" },
+          "retryable": { "type": "boolean" },
+          "retry_scheduled": { "type": "boolean" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "event_type": { "const": "ACTIVITY_COMPLETED" } } },
+      "then": {
+        "properties": {
+          "activity_name": { "type": "string" },
+          "attempt": { "type": "integer" },
+          "outcome_status": { "type": "string" },
+          "result_ref": { "type": "string" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "enum": ["WORKFLOW_FAILED", "WORKFLOW_REJECTED", "WORKFLOW_CANCELLED"]
+          }
+        }
+      },
+      "then": { "properties": { "error_code": { "type": "string" } } }
+    },
+    {
+      "if": { "properties": { "event_type": { "const": "WORKFLOW_SUCCEEDED" } } },
+      "then": { "properties": { "error_code": { "type": "null" } } }
+    }
+  ]
+}

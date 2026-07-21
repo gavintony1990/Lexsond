@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe.ai/schemas/probe-component-workflow-v1alpha2.json",
+  "title": "ProbeComponentWorkflow",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "component_id",
+    "component_label",
+    "icon",
+    "scenario",
+    "input_modalities",
+    "output_modalities",
+    "run_mode",
+    "binding_source",
+    "status",
+    "current_step_id",
+    "started_at",
+    "finished_at",
+    "failure_code",
+    "steps"
+  ],
+  "properties": {
+    "schema_version": { "const": "probe.ai/component-run/v1alpha2" },
+    "component_id": {
+      "enum": ["chat", "vision", "embedding", "image_generation", "audio_speech", "audio_transcription"]
+    },
+    "component_label": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "icon": { "type": "string", "pattern": "^[A-Z]{3}$" },
+    "scenario": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "input_modalities": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 4 },
+    "output_modalities": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 4 },
+    "run_mode": { "enum": ["single", "canary"] },
+    "binding_source": { "enum": ["PROVIDER_METADATA", "MANUAL_CONFIRMATION", "LEGACY_UNSPECIFIED"] },
+    "status": { "enum": ["RUNNING", "PASS", "WARN", "FAIL"] },
+    "current_step_id": { "type": ["string", "null"] },
+    "started_at": { "type": "string", "format": "date-time" },
+    "finished_at": { "type": ["string", "null"], "format": "date-time" },
+    "failure_code": { "type": ["string", "null"], "maxLength": 64 },
+    "steps": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": { "$ref": "#/$defs/stepRun" }
+    }
+  },
+  "$defs": {
+    "stepRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "stage",
+        "label",
+        "description",
+        "status",
+        "started_at",
+        "finished_at",
+        "facts"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$" },
+        "stage": { "enum": ["PRECHECK", "FIXTURE", "REQUEST", "TRANSPORT", "PROTOCOL", "ASSERTION", "EVIDENCE"] },
+        "label": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "description": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "status": { "enum": ["PENDING", "RUNNING", "PASS", "FAIL", "SKIPPED"] },
+        "started_at": { "type": ["string", "null"], "format": "date-time" },
+        "finished_at": { "type": ["string", "null"], "format": "date-time" },
+        "facts": {
+          "type": "array",
+          "maxItems": 8,
+          "items": { "type": "string", "maxLength": 128 }
+        }
+      }
+    }
+  }
+}

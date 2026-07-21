@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe.ai/schemas/runner-job-v1alpha1.json",
+  "title": "RunnerJob",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "job_id", "runner_name", "runner_version", "endpoint_snapshot_id", "model",
+    "suite_uri", "suite_sha256", "credential_handle", "timeout_seconds",
+    "max_requests", "max_concurrency", "max_cost_usd"
+  ],
+  "properties": {
+    "job_id": { "type": "string", "format": "uuid" },
+    "runner_name": { "enum": ["promptfoo", "evalscope", "aiperf", "guidellm"] },
+    "runner_version": { "type": "string", "minLength": 1 },
+    "endpoint_snapshot_id": { "type": "string", "minLength": 1 },
+    "model": { "type": "string", "minLength": 1 },
+    "suite_uri": { "type": "string", "minLength": 1 },
+    "suite_sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" },
+    "credential_handle": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque handle resolved only inside the runner; never a secret value"
+    },
+    "timeout_seconds": { "type": "number", "exclusiveMinimum": 0 },
+    "max_requests": { "type": "integer", "minimum": 1, "maximum": 100000 },
+    "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 100000 },
+    "max_cost_usd": { "type": "number", "exclusiveMinimum": 0 }
+  }
+}

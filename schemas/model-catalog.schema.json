@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe.ai/schemas/model-catalog-v1alpha1.json",
+  "title": "ModelCatalog",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["models"],
+  "properties": {
+    "models": {
+      "type": "array",
+      "maxItems": 2000,
+      "items": { "$ref": "#/$defs/model" }
+    }
+  },
+  "$defs": {
+    "boundedStrings": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+      "uniqueItems": true
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "owned_by",
+        "created",
+        "context_length",
+        "input_modalities",
+        "output_modalities",
+        "endpoint_types",
+        "probe_types",
+        "supported_parameters",
+        "supported_voices",
+        "capability_source"
+      ],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "owned_by": { "type": ["string", "null"], "minLength": 1, "maxLength": 256 },
+        "created": { "type": ["integer", "null"], "minimum": 0 },
+        "context_length": { "type": ["integer", "null"], "minimum": 0 },
+        "input_modalities": { "$ref": "#/$defs/boundedStrings" },
+        "output_modalities": { "$ref": "#/$defs/boundedStrings" },
+        "endpoint_types": { "$ref": "#/$defs/boundedStrings" },
+        "probe_types": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "chat",
+              "vision",
+              "embedding",
+              "image_generation",
+              "audio_speech",
+              "audio_transcription"
+            ]
+          }
+        },
+        "supported_parameters": { "$ref": "#/$defs/boundedStrings" },
+        "supported_voices": { "$ref": "#/$defs/boundedStrings" },
+        "capability_source": { "enum": ["PROVIDER_METADATA", "UNSPECIFIED"] }
+      }
+    }
+  }
+}

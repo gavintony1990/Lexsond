@@ -1,0 +1,1 @@
+{"index":0,"target":null,"messages":[],"agent_trace":null,"sample_score":{"score":{"value":{"inference_error":0,"expected_reject":1,"was_rejected":1,"passed":1},"extracted_prediction":null,"prediction":null,"explanation":null,"metadata":{"probe_kind":"immutable"},"main_score_name":null},"sample_id":0,"group_id":null,"sample_metadata":null}}

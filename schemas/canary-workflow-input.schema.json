@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe.ai/schemas/canary-workflow-input-v1alpha1.json",
+  "title": "CanaryWorkflowInput",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "run_id",
+    "endpoint_snapshot_id",
+    "suite_name",
+    "suite_version",
+    "suite_uri",
+    "suite_sha256",
+    "region",
+    "activity_timeout_seconds",
+    "activity_heartbeat_seconds",
+    "retry_policy",
+    "api_version",
+    "kind"
+  ],
+  "properties": {
+    "run_id": { "type": "string", "format": "uuid" },
+    "endpoint_snapshot_id": { "type": "string", "minLength": 1 },
+    "suite_name": { "type": "string", "minLength": 1 },
+    "suite_version": { "type": "string", "minLength": 1 },
+    "suite_uri": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^(file|s3|https)://[^?#]+$",
+      "description": "Immutable object reference; presigned URLs and embedded credentials are forbidden"
+    },
+    "suite_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "region": { "type": "string", "minLength": 1 },
+    "activity_timeout_seconds": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 900
+    },
+    "activity_heartbeat_seconds": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "retry_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_attempts",
+        "initial_backoff_seconds",
+        "backoff_multiplier",
+        "max_backoff_seconds"
+      ],
+      "properties": {
+        "max_attempts": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "initial_backoff_seconds": { "type": "number", "exclusiveMinimum": 0 },
+        "backoff_multiplier": { "type": "number", "minimum": 1 },
+        "max_backoff_seconds": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "api_version": { "const": "probe.ai/workflow/v1alpha1" },
+    "kind": { "const": "CanaryWorkflowInput" }
+  }
+}

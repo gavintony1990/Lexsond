@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe.ai/schemas/evidence-manifest-v1alpha1.json",
+  "title": "EvidenceManifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "evidence_id",
+    "run_id",
+    "evidence_kind",
+    "object_uri",
+    "object_sha256",
+    "byte_size",
+    "media_type",
+    "redaction_status",
+    "encrypted",
+    "retention_until",
+    "created_at",
+    "schema_version"
+  ],
+  "properties": {
+    "evidence_id": { "type": "string", "format": "uuid" },
+    "run_id": { "type": "string", "format": "uuid" },
+    "evidence_kind": {
+      "enum": [
+        "NORMALIZED_RESULT",
+        "REQUEST_TIMELINE",
+        "RUNNER_REPORT",
+        "RUNNER_REVIEW",
+        "RUNNER_LOG",
+        "BILLING_SNAPSHOT"
+      ]
+    },
+    "object_uri": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^(file|s3|https)://[^?#]+$"
+    },
+    "object_sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" },
+    "byte_size": { "type": "integer", "minimum": 0 },
+    "media_type": { "type": "string", "minLength": 1 },
+    "redaction_status": {
+      "enum": ["NOT_REQUIRED", "SANITIZED", "RAW_RESTRICTED"]
+    },
+    "encrypted": { "type": "boolean" },
+    "retention_until": { "type": ["string", "null"], "format": "date-time" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "schema_version": { "const": "probe.ai/evidence-manifest/v1alpha1" }
+  }
+}

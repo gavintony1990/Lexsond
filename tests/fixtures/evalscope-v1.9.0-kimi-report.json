@@ -1,0 +1,64 @@
+{
+  "name": "kimi_verifier",
+  "dataset_name": "kimi_verifier",
+  "dataset_pretty_name": "Kimi-Vendor-Verifier (Param Compliance)",
+  "dataset_description": "Sanitized contract fixture derived from EvalScope 1.9.0.",
+  "model_name": "relay-model",
+  "score": 1.0,
+  "metrics": [
+    {
+      "name": "param_immutable_reject_rate",
+      "num": 2,
+      "score": 1.0,
+      "macro_score": 1.0,
+      "categories": [
+        {
+          "name": ["default"],
+          "num": 2,
+          "score": 1.0,
+          "macro_score": 1.0,
+          "subsets": [
+            {"name": "kimi", "score": 1.0, "num": 2, "is_aggregate": false}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "param_default_accept_rate",
+      "num": 2,
+      "score": 1.0,
+      "macro_score": 1.0,
+      "categories": [
+        {
+          "name": ["default"],
+          "num": 2,
+          "score": 1.0,
+          "macro_score": 1.0,
+          "subsets": [
+            {"name": "kimi", "score": 1.0, "num": 2, "is_aggregate": false}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "inference_error_rate",
+      "num": 4,
+      "score": 0.0,
+      "macro_score": 0.0,
+      "categories": [
+        {
+          "name": ["default"],
+          "num": 4,
+          "score": 0.0,
+          "macro_score": 0.0,
+          "subsets": [
+            {"name": "kimi", "score": 0.0, "num": 4, "is_aggregate": false}
+          ]
+        }
+      ]
+    }
+  ],
+  "analysis": "N/A",
+  "perf_metrics": null,
+  "num": 2
+}

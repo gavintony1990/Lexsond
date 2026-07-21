@@ -1,0 +1,35 @@
+{
+  "apiVersion": "probe.ai/v1alpha1",
+  "kind": "ProbeSuite",
+  "metadata": {
+    "name": "openai-compatible-canary",
+    "version": "0.1.0"
+  },
+  "spec": {
+    "layer": "L2",
+    "protocol": "openai-chat",
+    "request": {
+      "prompt": "Reply with exactly: PROBE_OK",
+      "stream": true,
+      "max_output_tokens": 64
+    },
+    "sampling": {
+      "warmup": 1,
+      "requests": 10,
+      "concurrency": 1,
+      "timeout_seconds": 30,
+      "max_cost_usd": 0.1
+    },
+    "assertions": [
+      { "type": "http_status", "equals": 200 },
+      { "type": "success_rate", "gte": 0.99 },
+      { "type": "output_nonempty" },
+      { "type": "exact_text", "equals": "PROBE_OK" },
+      { "type": "sse_sequence_valid" },
+      { "type": "finish_reason_present" },
+      { "type": "pseudo_stream_absent" },
+      { "type": "ttft_ms", "p95_lte": 3000 },
+      { "type": "e2e_ms", "p95_lte": 10000 }
+    ]
+  }
+}

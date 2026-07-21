@@ -1,0 +1,32 @@
+{
+  "evalId": "eval-fail",
+  "results": {
+    "version": 3,
+    "timestamp": "2026-07-19T10:00:00+08:00",
+    "stats": { "successes": 0, "failures": 1, "errors": 1 },
+    "prompts": [],
+    "results": [
+      {
+        "testIdx": 0,
+        "promptIdx": 0,
+        "success": false,
+        "score": 0.25,
+        "gradingResult": {
+          "pass": false,
+          "score": 0.25,
+          "reason": "Expected JSON schema",
+          "componentResults": [{ "pass": false, "score": 0.25 }]
+        }
+      },
+      {
+        "testIdx": 1,
+        "promptIdx": 0,
+        "success": false,
+        "score": 0,
+        "error": "Provider request timed out"
+      }
+    ]
+  },
+  "config": {},
+  "shareableUrl": null
+}

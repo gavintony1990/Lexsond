@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+dist/
+!src/lexsond/web/dist/
+!src/lexsond/web/dist/**
+build/
+*.egg-info/
+.local/
+.DS_Store
+.idea/
+frontend/node_modules/

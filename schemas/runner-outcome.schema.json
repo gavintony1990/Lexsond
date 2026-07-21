@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe.ai/schemas/runner-outcome-v1alpha1.json",
+  "title": "RunnerOutcome",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "job_id", "runner_status", "runner_version", "result_schema_version",
+    "exit_code", "artifacts", "error_code", "sanitized_stderr", "started_at",
+    "finished_at"
+  ],
+  "properties": {
+    "job_id": { "type": "string", "format": "uuid" },
+    "runner_status": {
+      "enum": ["SUCCEEDED", "TARGET_FAILED", "RUNNER_FAILED", "CANCELLED"]
+    },
+    "runner_version": { "type": "string", "minLength": 1 },
+    "result_schema_version": { "type": "string", "minLength": 1 },
+    "exit_code": { "type": ["integer", "null"] },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["uri", "sha256", "media_type"],
+        "properties": {
+          "uri": { "type": "string", "minLength": 1 },
+          "sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" },
+          "media_type": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "error_code": { "type": ["string", "null"] },
+    "sanitized_stderr": { "type": ["string", "null"], "maxLength": 2000 },
+    "started_at": { "type": "string", "format": "date-time" },
+    "finished_at": { "type": "string", "format": "date-time" }
+  }
+}

@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lexsond"
+version = "0.7.0"
+description = "Lexsond: evidence-first quality probe for OpenAI-compatible APIs"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Lexsond Contributors" }]
+dependencies = []
+
+[project.optional-dependencies]
+web = [
+  "fastapi==0.139.2",
+  "httpx==0.28.1",
+  "langchain-core==1.4.9",
+  "pydantic==2.13.4",
+  "uvicorn==0.51.0",
+]
+temporal = ["temporalio==1.30.0"]
+postgres = [
+  "psycopg[binary]==3.3.4",
+  "psycopg-pool==3.3.1",
+]
+production = [
+  "fastapi==0.139.2",
+  "httpx==0.28.1",
+  "langchain-core==1.4.9",
+  "pydantic==2.13.4",
+  "uvicorn==0.51.0",
+  "temporalio==1.30.0",
+  "psycopg[binary]==3.3.4",
+  "psycopg-pool==3.3.1",
+]
+
+[project.scripts]
+lexsond = "lexsond.cli:main"
+lexsond-web = "lexsond.web.app:main"
+lexsond-web-legacy = "lexsond.web.server:main"
+lexsond-temporal-worker = "lexsond.workflows.temporal_worker:main"
+lexsond-temporal-start = "lexsond.workflows.temporal_start:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"lexsond.web" = ["default-suite.json", "dist/*", "dist/assets/*"]
+"lexsond.web.static" = ["*.html", "*.css", "*.js", "*.svg"]

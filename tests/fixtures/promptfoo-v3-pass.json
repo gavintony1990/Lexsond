@@ -1,0 +1,40 @@
+{
+  "evalId": "eval-pass",
+  "results": {
+    "version": 3,
+    "timestamp": "2026-07-19T10:00:00Z",
+    "stats": { "successes": 2, "failures": 0, "errors": 0 },
+    "prompts": [],
+    "results": [
+      {
+        "testIdx": 0,
+        "promptIdx": 0,
+        "provider": "openai:chat:relay-model",
+        "success": true,
+        "score": 1.0,
+        "latencyMs": 420,
+        "response": {
+          "output": "sensitive raw output is deliberately not imported",
+          "tokenUsage": { "prompt": 12, "completion": 5, "total": 17 }
+        },
+        "gradingResult": {
+          "pass": true,
+          "score": 1.0,
+          "reason": "Assertions passed",
+          "componentResults": [{ "pass": true, "score": 1.0 }]
+        }
+      },
+      {
+        "testIdx": 1,
+        "promptIdx": 0,
+        "provider": "openai:chat:relay-model",
+        "success": true,
+        "score": 0.8,
+        "response": { "output": "another raw output" },
+        "gradingResult": { "pass": true, "score": 0.8, "componentResults": [] }
+      }
+    ]
+  },
+  "config": {},
+  "shareableUrl": null
+}

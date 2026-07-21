@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe.ai/schemas/normalized-run-result-v1alpha1.json",
+  "title": "NormalizedRunResult",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "run_id",
+    "schema_version",
+    "suite_name",
+    "suite_version",
+    "status",
+    "reason_codes",
+    "started_at",
+    "finished_at",
+    "measurements",
+    "case_results",
+    "dimension_scores"
+  ],
+  "properties": {
+    "run_id": { "type": "string", "format": "uuid" },
+    "schema_version": { "const": "probe.ai/result/v1alpha1" },
+    "suite_name": { "type": "string", "minLength": 1 },
+    "suite_version": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["PASS", "WARN", "FAIL", "UNKNOWN"] },
+    "reason_codes": { "type": "array", "items": { "type": "string" } },
+    "started_at": { "type": "string", "format": "date-time" },
+    "finished_at": { "type": ["string", "null"], "format": "date-time" },
+    "measurements": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/requestMeasurement" }
+    },
+    "case_results": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/probeCaseResult" }
+    },
+    "dimension_scores": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/dimensionScore" }
+    }
+  },
+  "$defs": {
+    "nullableNumber": { "type": ["number", "null"], "minimum": 0 },
+    "nullableInteger": { "type": ["integer", "null"], "minimum": 0 },
+    "chunkMeasurement": {
+      "type": "object",
+      "required": ["sequence", "received_after_ms", "event_type", "content_chars", "has_usage", "finish_reason"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 0 },
+        "received_after_ms": { "type": "number", "minimum": 0 },
+        "event_type": { "type": ["string", "null"] },
+        "content_chars": { "type": "integer", "minimum": 0 },
+        "reasoning_chars": { "type": "integer", "minimum": 0 },
+        "has_usage": { "type": "boolean" },
+        "finish_reason": { "type": ["string", "null"] }
+      }
+    },
+    "dimensionScore": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dimension", "score", "status", "sample_count", "reason_codes",
+        "metrics", "confidence_interval"
+      ],
+      "properties": {
+        "dimension": { "enum": ["availability", "protocol", "performance", "quality"] },
+        "score": { "type": ["number", "null"], "minimum": 0, "maximum": 100 },
+        "status": { "enum": ["PASS", "WARN", "FAIL", "UNKNOWN"] },
+        "sample_count": { "type": "integer", "minimum": 0 },
+        "reason_codes": { "type": "array", "items": { "type": "string" } },
+        "metrics": { "type": "object" },
+        "confidence_interval": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["lower", "upper"],
+              "properties": {
+                "lower": { "type": "number", "minimum": 0, "maximum": 1 },
+                "upper": { "type": "number", "minimum": 0, "maximum": 1 }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "probeCaseResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id", "status", "score", "reason_codes", "latency_ms",
+        "provider_reported_input_tokens", "provider_reported_output_tokens",
+        "provider_reported_total_tokens", "evidence"
+      ],
+      "properties": {
+        "case_id": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["PASS", "WARN", "FAIL", "UNKNOWN"] },
+        "score": { "type": ["number", "null"], "minimum": 0, "maximum": 100 },
+        "reason_codes": { "type": "array", "items": { "type": "string" } },
+        "latency_ms": { "$ref": "#/$defs/nullableNumber" },
+        "provider_reported_input_tokens": { "$ref": "#/$defs/nullableInteger" },
+        "provider_reported_output_tokens": { "$ref": "#/$defs/nullableInteger" },
+        "provider_reported_total_tokens": { "$ref": "#/$defs/nullableInteger" },
+        "evidence": { "type": "object" }
+      }
+    },
+    "requestMeasurement": {
+      "type": "object",
+      "required": [
+        "request_id", "endpoint", "requested_model", "response_model", "streaming",
+        "status_code", "error_class", "error_message", "started_at", "connect_ms", "response_headers_ms",
+        "ttfb_ms", "ttft_ms", "e2e_ms", "itl_ms", "output_tps", "chunk_count",
+        "output_text", "finish_reason", "provider_reported_input_tokens",
+        "provider_reported_output_tokens", "provider_reported_total_tokens",
+        "locally_estimated_input_tokens", "locally_estimated_output_tokens", "chunks", "evidence"
+      ],
+      "properties": {
+        "request_id": { "type": "string", "format": "uuid" },
+        "endpoint": { "type": "string" },
+        "requested_model": { "type": "string" },
+        "response_model": { "type": ["string", "null"] },
+        "streaming": { "type": "boolean" },
+        "status_code": { "type": ["integer", "null"] },
+        "error_class": { "type": ["string", "null"] },
+        "error_message": { "type": ["string", "null"] },
+        "started_at": { "type": "string", "format": "date-time" },
+        "connect_ms": { "$ref": "#/$defs/nullableNumber" },
+        "response_headers_ms": { "$ref": "#/$defs/nullableNumber" },
+        "ttfb_ms": { "$ref": "#/$defs/nullableNumber" },
+        "ttft_ms": { "$ref": "#/$defs/nullableNumber" },
+        "e2e_ms": { "$ref": "#/$defs/nullableNumber" },
+        "itl_ms": { "$ref": "#/$defs/nullableNumber" },
+        "output_tps": { "$ref": "#/$defs/nullableNumber" },
+        "chunk_count": { "type": "integer", "minimum": 0 },
+        "output_text": { "type": "string" },
+        "finish_reason": { "type": ["string", "null"] },
+        "provider_reported_input_tokens": { "$ref": "#/$defs/nullableInteger" },
+        "provider_reported_output_tokens": { "$ref": "#/$defs/nullableInteger" },
+        "provider_reported_total_tokens": { "$ref": "#/$defs/nullableInteger" },
+        "locally_estimated_input_tokens": { "$ref": "#/$defs/nullableInteger" },
+        "locally_estimated_output_tokens": { "$ref": "#/$defs/nullableInteger" },
+        "chunks": { "type": "array", "items": { "$ref": "#/$defs/chunkMeasurement" } },
+        "evidence": { "type": "object" }
+      }
+    }
+  }
+}
