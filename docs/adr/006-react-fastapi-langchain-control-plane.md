@@ -44,7 +44,7 @@ extensions. Replacing it with a generic SDK would change measurement semantics.
 
 The control API, UI, local executor, and Temporal launcher now share one run
 index and lifecycle. Refreshing a run page reconstructs progress from persisted
-events. Production requires migrations `0001`, `0002`, and `0003`; the control
+events. Production requires migrations `0001` through `0005`; the control
 and worker roles remain distinct. A configured but unavailable Temporal backend
 is a visible failure rather than an implicit local fallback.
 

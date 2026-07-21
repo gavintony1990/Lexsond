@@ -8,6 +8,7 @@ import {
   Database,
   FlaskConical,
   Gauge,
+  Grid3X3,
   Menu,
   Play,
   Radio,
@@ -23,6 +24,7 @@ import type { ResultStatus, RunState } from "./types";
 const navigation = [
   { to: "/", label: "观测总览", code: "OVR", icon: Gauge },
   { to: "/agent", label: "探针智能体", code: "AGT", icon: Bot },
+  { to: "/monitoring", label: "持续监控", code: "MON", icon: Grid3X3 },
   { to: "/runs", label: "运行记录", code: "RUN", icon: Activity },
   { to: "/targets", label: "探测目标", code: "TGT", icon: TargetIcon },
   { to: "/suites", label: "套件库", code: "STE", icon: FlaskConical },
@@ -80,7 +82,7 @@ export function Shell({ children }: PropsWithChildren) {
         </div>
         <div className="rail-version">
           <span>CORE</span>
-          <b>v{bootstrap.data?.product.version ?? "0.7.0"}</b>
+          <b>v{bootstrap.data?.product.version ?? "0.8.0"}</b>
           <span>NO RAW PAYLOAD</span>
         </div>
       </aside>

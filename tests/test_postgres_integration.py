@@ -59,6 +59,7 @@ class PostgresIntegrationTests(unittest.TestCase):
             cls._psql_file("0002_access.sql")
             cls._psql_file("0003_control_plane.sql")
             cls._psql_file("0004_agent_control_plane.sql")
+            cls._psql_file("0005_continuous_monitoring.sql")
             from lexsond.storage.postgres import PostgresPool
 
             cls.pool = PostgresPool(cls.dsn, min_size=1, max_size=8)
@@ -211,6 +212,105 @@ class PostgresIntegrationTests(unittest.TestCase):
         store.purge_target(target["id"])
         store.archive_suite(suite["id"])
         store.purge_suite(suite["id"])
+
+    def test_postgres_monitoring_claim_projection_and_retention(self) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        from lexsond.web.control_store import ControlPlaneConflict
+        from lexsond.web.postgres_control_store import PostgresControlPlaneStore
+
+        store = PostgresControlPlaneStore(self.pool)
+        suffix = uuid4().hex[:10]
+        target = store.create_target(
+            {
+                "name": f"monitor-{suffix}",
+                "target_kind": "local",
+                "provider_id": None,
+                "base_url": "http://127.0.0.1:8000/v1",
+                "default_model": "mock",
+                "credential_ref": None,
+            }
+        )
+        policy = store.create_monitor_policy(
+            {
+                "name": f"pulse-{suffix}",
+                "target_id": target["id"],
+                "suite_revision_id": None,
+                "run_kind": "component",
+                "probe_type": "chat",
+                "execution_backend": "local",
+                "model": "mock",
+                "stream": False,
+                "timeout_seconds": 5,
+                "interval_seconds": 60,
+                "failure_threshold": 2,
+                "recovery_threshold": 1,
+                "enabled": True,
+            }
+        )
+        claims = store.claim_due_monitor_policies(
+            now=(datetime.now(UTC) + timedelta(days=1)).isoformat(),
+            limit=32,
+            lease_seconds=30,
+        )
+        claim = next(item for item in claims if item["id"] == policy["id"])
+        with self.assertRaisesRegex(ControlPlaneConflict, "already in progress"):
+            store.request_monitor_policy_run(policy["id"])
+        with self.assertRaisesRegex(ControlPlaneConflict, "already in progress"):
+            store.update_monitor_policy(
+                policy["id"],
+                {"interval_seconds": 120},
+                expected_version=policy["version"],
+            )
+        run_id = str(uuid4())
+        store.create_run(
+            run_id,
+            {
+                "target_id": target["id"],
+                "suite_revision_id": None,
+                "monitor_policy_id": policy["id"],
+                "run_kind": "component",
+                "execution_backend": "local",
+                "base_url": target["base_url"],
+                "model": "mock",
+                "target_kind": "local",
+                "provider_id": None,
+                "run_mode": "single",
+                "probe_type": "chat",
+                "stream": False,
+                "timeout_seconds": 5,
+            },
+            {"schema_version": "test", "status": "RUNNING"},
+        )
+        store.complete_monitor_policy_dispatch(
+            policy["id"],
+            lease_token=claim["lease_token"],
+            scheduled_for=claim["scheduled_for"],
+            run_id=run_id,
+        )
+        store.complete_run(
+            run_id,
+            {"status": "PASS", "dimension_scores": [], "measurements": []},
+            {"schema_version": "test", "status": "PASS"},
+        )
+        projected = store.record_monitor_run(run_id)
+        self.assertEqual(projected["state"]["status"], "UP")
+        self.assertTrue(store.record_monitor_run(run_id)["replayed"])
+        store.archive_run(run_id)
+        with self.assertRaisesRegex(ControlPlaneConflict, "current monitor state"):
+            store.purge_run(run_id)
+        self.assertEqual(store.monitoring_overview(window="24h")["summary"]["up"], 1)
+        removed = store.prune_monitoring_data(
+            samples_before="2999-01-01T00:00:00+00:00",
+            incidents_before="2999-01-01T00:00:00+00:00",
+        )
+        self.assertEqual(removed["samples"], 1)
+
+        store.archive_monitor_policy(policy["id"])
+        store.purge_monitor_policy(policy["id"])
+        store.purge_run(run_id)
+        store.archive_target(target["id"])
+        store.purge_target(target["id"])
 
     def test_postgres_agent_checkpointer_supports_session_memory_and_events(self) -> None:
         from lexsond.web.postgres_control_store import PostgresControlPlaneStore
@@ -655,6 +755,8 @@ class PostgresIntegrationTests(unittest.TestCase):
             self._psql_file("0002_access.sql", database=database)
             self._psql_file("0003_control_plane.sql", database=database)
             self._psql_file("0004_agent_control_plane.sql", database=database)
+            self._psql_file("0005_continuous_monitoring.sql", database=database)
+            self._psql_file("0005_continuous_monitoring.down.sql", database=database)
             self._psql_file("0004_agent_control_plane.down.sql", database=database)
             self._psql_file("0003_control_plane.down.sql", database=database)
             self._psql_file("0002_access.down.sql", database=database)

@@ -12,6 +12,8 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .probe import (
+    UnsafeTargetAddress,
+    _create_guarded_http_connection,
     _wrap_connection_with_deadline,
     validate_api_key_value,
     validate_base_url_transport,
@@ -105,17 +107,7 @@ def fetch_model_catalog_entries(
         raise ValueError("timeout_seconds must be between 0.1 and 30")
 
     parsed = urlsplit(base_url.rstrip("/"))
-    connection_class = (
-        http.client.HTTPSConnection
-        if parsed.scheme == "https"
-        else http.client.HTTPConnection
-    )
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    connection = connection_class(
-        parsed.hostname,
-        port,
-        timeout=float(timeout_seconds),
-    )
+    connection = _create_guarded_http_connection(parsed, float(timeout_seconds))
     if provider_id == "ollama":
         path = "/api/tags"
     else:
@@ -126,7 +118,7 @@ def fetch_model_catalog_entries(
             path += "?output_modalities=all"
     headers = {
         "Accept": "application/json",
-        "User-Agent": "lexsond/0.7",
+        "User-Agent": "lexsond/0.8",
     }
     if api_key is not None:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -146,6 +138,8 @@ def fetch_model_catalog_entries(
         raise TargetConnectionError("target model catalog TLS handshake failed") from exc
     except TimeoutError as exc:
         raise TargetConnectionError("target model catalog request timed out") from exc
+    except UnsafeTargetAddress as exc:
+        raise TargetConnectionError("target model catalog resolved to a blocked network") from exc
     except (ConnectionError, socket.gaierror, OSError) as exc:
         raise TargetConnectionError("target model catalog is unreachable") from exc
     finally:

@@ -7,6 +7,11 @@ import type {
   AgentSessionCreateInput,
   ApiErrorBody,
   Bootstrap,
+  MonitorIncident,
+  MonitorPolicy,
+  MonitorPolicyCreateInput,
+  MonitorPolicyPatchInput,
+  MonitoringOverview,
   RunCreateInput,
   Run,
   RunEvent,
@@ -118,6 +123,29 @@ export const api = {
   archiveSuite: (id: string) => request<Suite>(`/suites/${id}`, { method: "DELETE" }),
   restoreSuite: (id: string) => request<Suite>(`/suites/${id}/restore`, { method: "POST" }),
   purgeSuite: (id: string) => request<void>(`/suites/${id}/purge`, { method: "DELETE" }),
+  monitorPolicies: (includeArchived = false) =>
+    request<MonitorPolicy[]>(`/monitor-policies?include_archived=${includeArchived}`),
+  monitorPolicy: (id: string, includeArchived = false) =>
+    request<MonitorPolicy>(`/monitor-policies/${id}?include_archived=${includeArchived}`),
+  createMonitorPolicy: (value: MonitorPolicyCreateInput) =>
+    request<MonitorPolicy>("/monitor-policies", json(value)),
+  updateMonitorPolicy: (id: string, value: MonitorPolicyPatchInput) =>
+    request<MonitorPolicy>(`/monitor-policies/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(value),
+    }),
+  runMonitorPolicyNow: (id: string) =>
+    request<MonitorPolicy>(`/monitor-policies/${id}/run-now`, { method: "POST" }),
+  archiveMonitorPolicy: (id: string) =>
+    request<MonitorPolicy>(`/monitor-policies/${id}`, { method: "DELETE" }),
+  restoreMonitorPolicy: (id: string) =>
+    request<MonitorPolicy>(`/monitor-policies/${id}/restore`, { method: "POST" }),
+  purgeMonitorPolicy: (id: string) =>
+    request<void>(`/monitor-policies/${id}/purge`, { method: "DELETE" }),
+  monitoringOverview: (window: "90m" | "24h" | "7d" | "30d") =>
+    request<MonitoringOverview>(`/monitoring/overview?window=${window}`),
+  monitorIncidents: (limit = 100) =>
+    request<MonitorIncident[]>(`/monitoring/incidents?limit=${limit}`),
   runs: (includeArchived = false) =>
     request<Run[]>(`/runs?include_archived=${includeArchived}&limit=100`),
   run: (id: string, includeArchived = false) =>

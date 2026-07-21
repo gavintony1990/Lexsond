@@ -107,6 +107,7 @@ class ProbeConfig:
     probe_type: ProbeType = ProbeType.CHAT
     provider_id: str | None = None
     audio_voice: str | None = None
+    expected_text: str | None = None
 
     def __post_init__(self) -> None:
         validate_base_url_transport(self.base_url)
@@ -131,6 +132,19 @@ class ProbeConfig:
             or any(ord(character) < 0x20 for character in self.audio_voice)
         ):
             raise ValueError("audio_voice must be a bounded printable string or null")
+        if self.expected_text is not None and (
+            not isinstance(self.expected_text, str)
+            or not self.expected_text.strip()
+            or len(self.expected_text) > 512
+            or any(ord(character) < 0x20 for character in self.expected_text)
+        ):
+            raise ValueError("expected_text must be a bounded printable string or null")
+        if (
+            self.api_key is not None
+            and self.expected_text is not None
+            and self.api_key in self.expected_text
+        ):
+            raise ValueError("expected_text must not contain api_key")
         if (
             self.api_key is not None
             and self.audio_voice is not None
@@ -194,6 +208,108 @@ def validate_base_url_transport(base_url: str) -> None:
             )
 
 
+class UnsafeTargetAddress(OSError):
+    """Raised when a target resolves into a network Lexsond must not reach."""
+
+
+def _create_guarded_http_connection(
+    parsed: Any,
+    timeout_seconds: float,
+) -> http.client.HTTPConnection:
+    connection_class = (
+        http.client.HTTPSConnection
+        if parsed.scheme == "https"
+        else http.client.HTTPConnection
+    )
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    connection = connection_class(
+        parsed.hostname,
+        port,
+        timeout=float(timeout_seconds),
+    )
+    # HTTPConnection stores the socket factory on the instance. Replacing it
+    # keeps the original hostname for Host/SNI/certificate checks, while the
+    # actual connect uses only the addresses validated in this DNS response.
+    connection._create_connection = _guarded_socket_connection  # type: ignore[attr-defined]
+    return connection
+
+
+def _guarded_socket_connection(
+    address: tuple[str, int],
+    timeout: float | object = socket._GLOBAL_DEFAULT_TIMEOUT,
+    source_address: tuple[str, int] | None = None,
+) -> socket.socket:
+    host, port = address
+    try:
+        candidates = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    except socket.gaierror:
+        raise
+    if not candidates:
+        raise socket.gaierror("target hostname returned no addresses")
+    _validate_resolved_addresses(host, candidates)
+    last_error: OSError | None = None
+    for family, socktype, proto, _, sockaddr in candidates:
+        sock: socket.socket | None = None
+        try:
+            sock = socket.socket(family, socktype, proto)
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                sock.settimeout(timeout)  # type: ignore[arg-type]
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            if sock is not None:
+                sock.close()
+    if last_error is not None:
+        raise last_error
+    raise OSError("target connection failed")
+
+
+def _validate_resolved_addresses(host: str, candidates: list[tuple[Any, ...]]) -> None:
+    normalized_host = host.rstrip(".").lower()
+    try:
+        literal = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        literal = None
+    addresses = []
+    for candidate in candidates:
+        sockaddr = candidate[4]
+        try:
+            addresses.append(ipaddress.ip_address(str(sockaddr[0]).split("%", 1)[0]))
+        except ValueError as exc:
+            raise UnsafeTargetAddress("target DNS returned an invalid address") from exc
+    if (literal is not None and literal.is_loopback) or normalized_host == "localhost":
+        if all(address.is_loopback for address in addresses):
+            return
+        raise UnsafeTargetAddress("loopback target resolved outside the loopback network")
+    if literal is not None and any(address != literal for address in addresses):
+        raise UnsafeTargetAddress("numeric target resolved to a different address")
+    if not all(_is_public_target_address(address) for address in addresses):
+        raise UnsafeTargetAddress("target resolved to a blocked non-public network")
+
+
+def _is_public_target_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Reject non-unicast and IPv4-embedding routes to protected networks."""
+
+    if not address.is_global or address.is_multicast or address.is_unspecified:
+        return False
+    if isinstance(address, ipaddress.IPv4Address):
+        return True
+
+    embedded = address.ipv4_mapped
+    nat64_networks = (
+        ipaddress.ip_network("64:ff9b::/96"),
+        ipaddress.ip_network("64:ff9b:1::/48"),
+    )
+    if embedded is None and any(address in network for network in nat64_networks):
+        embedded = ipaddress.ip_address(int(address) & 0xFFFFFFFF)
+    if embedded is not None:
+        return _is_public_target_address(embedded)
+    return True
+
+
 class OpenAIChatProbe:
     _MAX_RESPONSE_BYTES = 16 * 1024 * 1024
     _MAX_SSE_EVENTS = 1_024
@@ -251,6 +367,13 @@ class OpenAIChatProbe:
                 ):
                     self.progress.fail_active()
                     run.finish(RunStatus.FAIL, "VISION_ASSERTION_FAILED")
+                elif (
+                    self.config.expected_text is not None
+                    and measurement.output_text.strip()
+                    != self.config.expected_text.strip()
+                ):
+                    self.progress.fail_active()
+                    run.finish(RunStatus.FAIL, "EXPECTED_TEXT_ASSERTION_FAILED")
                 else:
                     self.progress.pass_active()
                     run.finish(RunStatus.PASS, "REQUEST_SUCCEEDED")
@@ -262,13 +385,9 @@ class OpenAIChatProbe:
     def _execute(self, measurement: RequestMeasurement) -> None:
         self.progress.start("fixture_prepare")
         parsed = urlsplit(self.config.base_url.rstrip("/"))
-        connection_cls = (
-            http.client.HTTPSConnection
-            if parsed.scheme == "https"
-            else http.client.HTTPConnection
+        connection = _create_guarded_http_connection(
+            parsed, self.config.timeout_seconds
         )
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        connection = connection_cls(parsed.hostname, port, timeout=self.config.timeout_seconds)
         path_prefix = parsed.path.rstrip("/")
         path = f"{path_prefix}/chat/completions"
         content: str | list[dict[str, Any]] = self.config.prompt
@@ -731,13 +850,9 @@ class OpenAIEndpointProbe:
     def _execute(self, measurement: RequestMeasurement) -> None:
         self.progress.start("fixture_prepare")
         parsed = urlsplit(self.config.base_url.rstrip("/"))
-        connection_cls = (
-            http.client.HTTPSConnection
-            if parsed.scheme == "https"
-            else http.client.HTTPConnection
+        connection = _create_guarded_http_connection(
+            parsed, self.config.timeout_seconds
         )
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        connection = connection_cls(parsed.hostname, port, timeout=self.config.timeout_seconds)
         suffix, body, content_type, accept, consumer = self._request_contract()
         path = f"{parsed.path.rstrip('/')}{suffix}"
         measurement.evidence["endpoint_type"] = self.config.probe_type.value

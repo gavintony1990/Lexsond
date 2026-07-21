@@ -7,6 +7,7 @@ import { Runs } from "./pages/Runs";
 import { NewRun } from "./pages/NewRun";
 import { RunDetail } from "./pages/RunDetail";
 import { AgentWorkbench } from "./pages/AgentWorkbench";
+import { Monitoring } from "./pages/Monitoring";
 
 export function App() {
   return (
@@ -15,6 +16,7 @@ export function App() {
         <Route path="/" element={<Overview />} />
         <Route path="/agent" element={<AgentWorkbench />} />
         <Route path="/agent/:sessionId" element={<AgentWorkbench />} />
+        <Route path="/monitoring" element={<Monitoring />} />
         <Route path="/targets" element={<Targets />} />
         <Route path="/suites" element={<Suites />} />
         <Route path="/runs" element={<Runs />} />

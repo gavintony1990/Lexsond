@@ -109,6 +109,29 @@ class PostgresMigrationContractTests(unittest.TestCase):
         self.assertIn("authorization", up)
         self.assertIn("TO lexsond_control", up)
 
+    def test_monitoring_migration_has_leases_state_events_and_reader_boundary(self) -> None:
+        up = (MIGRATIONS / "0005_continuous_monitoring.sql").read_text(
+            encoding="utf-8"
+        )
+        down = (MIGRATIONS / "0005_continuous_monitoring.down.sql").read_text(
+            encoding="utf-8"
+        )
+        for table in (
+            "monitor_policies",
+            "monitor_states",
+            "monitor_samples",
+            "monitor_incident_events",
+        ):
+            self.assertIn(f"CREATE TABLE lexsond.{table}", up)
+            self.assertIn(f"DROP TABLE IF EXISTS lexsond.{table}", down)
+        self.assertIn("lease_token UUID", up)
+        self.assertIn("schedule_offset_seconds", up)
+        self.assertIn("monitor_samples_are_immutable", up)
+        self.assertIn("monitor_incidents_are_immutable", up)
+        self.assertIn("ON DELETE SET NULL", up)
+        self.assertIn("TO lexsond_control", up)
+        self.assertIn("TO lexsond_reader", up)
+
 
 if __name__ == "__main__":
     unittest.main()

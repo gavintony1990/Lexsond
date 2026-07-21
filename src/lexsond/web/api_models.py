@@ -183,3 +183,57 @@ class RunCreate(StrictModel):
         ):
             raise ValueError("Temporal currently supports chat and chat suites only")
         return self
+
+
+class MonitorPolicyCreate(StrictModel):
+    name: str = Field(min_length=1, max_length=120)
+    target_id: UUID
+    run_kind: Literal["component", "suite"] = "component"
+    probe_type: ProbeType | None = ProbeType.CHAT
+    suite_revision_id: UUID | None = None
+    execution_backend: Literal["local", "temporal"] = "local"
+    model: str | None = Field(default=None, max_length=256)
+    stream: bool = True
+    timeout_seconds: float = Field(default=30.0, ge=0.1, le=300)
+    interval_seconds: int = Field(default=300, ge=60, le=2_592_000)
+    failure_threshold: int = Field(default=2, ge=1, le=10)
+    recovery_threshold: int = Field(default=1, ge=1, le=10)
+    enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_policy_shape(self) -> Self:
+        if self.run_kind == "suite":
+            if self.suite_revision_id is None:
+                raise ValueError("suite_revision_id is required for suite monitor policies")
+            if self.probe_type not in {None, ProbeType.CHAT}:
+                raise ValueError("suite monitor policies use the chat probe")
+        elif self.suite_revision_id is not None:
+            raise ValueError("suite_revision_id is only valid for suite monitor policies")
+        if self.run_kind == "component" and self.probe_type is None:
+            raise ValueError("probe_type is required for component monitor policies")
+        if self.stream and self.probe_type not in {ProbeType.CHAT, ProbeType.VISION}:
+            raise ValueError("stream is supported only for chat and vision probes")
+        if (
+            self.execution_backend == "temporal"
+            and self.run_kind == "component"
+            and self.probe_type != ProbeType.CHAT
+        ):
+            raise ValueError("Temporal currently supports chat monitor policies only")
+        return self
+
+
+class MonitorPolicyPatch(StrictModel):
+    version: int = Field(ge=1)
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    target_id: UUID | None = None
+    run_kind: Literal["component", "suite"] | None = None
+    probe_type: ProbeType | None = None
+    suite_revision_id: UUID | None = None
+    execution_backend: Literal["local", "temporal"] | None = None
+    model: str | None = Field(default=None, max_length=256)
+    stream: bool | None = None
+    timeout_seconds: float | None = Field(default=None, ge=0.1, le=300)
+    interval_seconds: int | None = Field(default=None, ge=60, le=2_592_000)
+    failure_threshold: int | None = Field(default=None, ge=1, le=10)
+    recovery_threshold: int | None = Field(default=None, ge=1, le=10)
+    enabled: bool | None = None

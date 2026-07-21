@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Mapping
 from uuid import uuid4
 
@@ -10,12 +10,22 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from ..storage.postgres import PostgresPool
+from ..monitoring.state import MonitorState, MonitorStatus, transition_state
 from ..storage.redaction import redact_text, redact_value
 from ..suite import compile_suite
 from .control_store import (
     ControlPlaneConflict,
     ControlPlaneNotFound,
     _contains_forbidden_agent_key,
+    _aggregate_monitor_buckets,
+    _monitor_metrics,
+    _monitor_observation,
+    _monitor_timeline,
+    _monitor_window,
+    _next_schedule,
+    _parse_utc,
+    _schedule_offset,
+    _validate_monitor_policy_value,
     _require_agent_turn_token,
     _validate_agent_event_fields,
     _validate_agent_session_changes,
@@ -154,6 +164,11 @@ class PostgresControlPlaneStore:
                 (target_id,),
             ).fetchone():
                 raise ControlPlaneConflict("target is referenced by an Agent session")
+            if connection.execute(
+                "SELECT 1 FROM lexsond.monitor_policies WHERE target_id = %s LIMIT 1",
+                (target_id,),
+            ).fetchone():
+                raise ControlPlaneConflict("target is referenced by a monitor policy")
             connection.execute(
                 "DELETE FROM lexsond.targets WHERE target_id = %s", (target_id,)
             )
@@ -336,6 +351,16 @@ class PostgresControlPlaneStore:
                 (suite_id,),
             ).fetchone():
                 raise ControlPlaneConflict("suite is referenced by a run")
+            if connection.execute(
+                """
+                SELECT 1 FROM lexsond.monitor_policies p
+                JOIN lexsond.suite_revisions sr
+                  ON sr.revision_id = p.suite_revision_id
+                WHERE sr.suite_id = %s LIMIT 1
+                """,
+                (suite_id,),
+            ).fetchone():
+                raise ControlPlaneConflict("suite is referenced by a monitor policy")
             connection.execute(
                 "DELETE FROM lexsond.suite_revisions WHERE suite_id = %s",
                 (suite_id,),
@@ -810,6 +835,639 @@ class PostgresControlPlaneStore:
             ).fetchall()
         return [_agent_event(row) for row in rows]
 
+    # Continuous monitoring policies and derived health state
+
+    def create_monitor_policy(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        _validate_monitor_policy_value(value)
+        policy_id = str(uuid4())
+        interval = int(value["interval_seconds"])
+        offset = _schedule_offset(policy_id, interval)
+        next_run_at = (
+            datetime.now(UTC) + timedelta(seconds=offset)
+            if bool(value.get("enabled", True))
+            else None
+        )
+        try:
+            with self._pool.connection() as connection:
+                _require_monitor_references(connection, value)
+                connection.execute(
+                    """
+                    INSERT INTO lexsond.monitor_policies (
+                        policy_id, name, target_id, suite_revision_id, run_kind,
+                        probe_type, execution_backend, model, streaming,
+                        timeout_seconds, interval_seconds, failure_threshold,
+                        recovery_threshold, schedule_offset_seconds, enabled,
+                        next_run_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                              %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        policy_id,
+                        value["name"],
+                        str(value["target_id"]),
+                        str(value["suite_revision_id"])
+                        if value.get("suite_revision_id") is not None
+                        else None,
+                        value["run_kind"],
+                        str(value.get("probe_type") or "chat"),
+                        value["execution_backend"],
+                        value["model"],
+                        bool(value["stream"]),
+                        float(value["timeout_seconds"]),
+                        interval,
+                        int(value["failure_threshold"]),
+                        int(value["recovery_threshold"]),
+                        offset,
+                        bool(value.get("enabled", True)),
+                        next_run_at,
+                    ),
+                )
+        except psycopg.errors.UniqueViolation as exc:
+            raise ControlPlaneConflict("monitor policy conflicts with stored data") from exc
+        return self.get_monitor_policy(policy_id, include_archived=True)
+
+    def get_monitor_policy(
+        self, policy_id: str, *, include_archived: bool = False
+    ) -> dict[str, Any]:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM lexsond.monitor_policies WHERE policy_id = %s",
+                (policy_id,),
+            ).fetchone()
+        if row is None or (row["archived_at"] is not None and not include_archived):
+            raise ControlPlaneNotFound("monitor policy was not found")
+        return _monitor_policy(row)
+
+    def list_monitor_policies(
+        self, *, include_archived: bool = False
+    ) -> list[dict[str, Any]]:
+        where = "" if include_archived else "WHERE archived_at IS NULL"
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM lexsond.monitor_policies {where}
+                ORDER BY updated_at DESC, policy_id
+                """
+            ).fetchall()
+        return [_monitor_policy(row) for row in rows]
+
+    def update_monitor_policy(
+        self,
+        policy_id: str,
+        changes: Mapping[str, Any],
+        *,
+        expected_version: int,
+    ) -> dict[str, Any]:
+        if not changes:
+            return self.get_monitor_policy(policy_id, include_archived=True)
+        allowed = {
+            "name", "target_id", "suite_revision_id", "run_kind", "probe_type",
+            "execution_backend", "model", "stream", "timeout_seconds",
+            "interval_seconds", "failure_threshold", "recovery_threshold", "enabled",
+        }
+        if set(changes) - allowed:
+            raise ValueError("monitor policy update contains unknown fields")
+        current = self.get_monitor_policy(policy_id, include_archived=True)
+        if current["archived_at"] is not None:
+            raise ControlPlaneConflict("archived monitor policy cannot be updated")
+        merged = {**current, **changes}
+        _validate_monitor_policy_value(merged)
+        interval = int(merged["interval_seconds"])
+        offset = _schedule_offset(policy_id, interval)
+        normalized = {
+            ("streaming" if field == "stream" else field): (
+                str(value)
+                if field in {"target_id", "suite_revision_id", "probe_type"}
+                and value is not None
+                else value
+            )
+            for field, value in changes.items()
+        }
+        if "interval_seconds" in changes:
+            normalized["schedule_offset_seconds"] = offset
+        if {"enabled", "interval_seconds"} & set(changes):
+            normalized["next_run_at"] = (
+                datetime.now(UTC) + timedelta(seconds=offset)
+                if bool(merged["enabled"])
+                else None
+            )
+            normalized["lease_token"] = None
+            normalized["lease_until"] = None
+        assignments = [f"{field} = %s" for field in normalized]
+        try:
+            with self._pool.connection() as connection:
+                _require_monitor_references(connection, merged)
+                cursor = connection.execute(
+                    f"""
+                    UPDATE lexsond.monitor_policies
+                    SET {', '.join(assignments)}, version = version + 1,
+                        updated_at = clock_timestamp()
+                    WHERE policy_id = %s AND version = %s AND archived_at IS NULL
+                      AND (lease_until IS NULL OR lease_until <= clock_timestamp())
+                    """,
+                    (*normalized.values(), policy_id, expected_version),
+                )
+                if cursor.rowcount != 1:
+                    locked = connection.execute(
+                        "SELECT lease_until FROM lexsond.monitor_policies WHERE policy_id = %s",
+                        (policy_id,),
+                    ).fetchone()
+                    if (
+                        locked is not None
+                        and locked["lease_until"] is not None
+                        and locked["lease_until"] > datetime.now(UTC)
+                    ):
+                        raise ControlPlaneConflict(
+                            "monitor policy dispatch is already in progress"
+                        )
+                    _raise_monitor_update_conflict(connection, policy_id)
+        except psycopg.errors.UniqueViolation as exc:
+            raise ControlPlaneConflict("monitor policy update conflicts with stored data") from exc
+        return self.get_monitor_policy(policy_id, include_archived=True)
+
+    def archive_monitor_policy(self, policy_id: str) -> dict[str, Any]:
+        with self._pool.connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE lexsond.monitor_policies
+                SET archived_at = clock_timestamp(), enabled = FALSE,
+                    next_run_at = NULL, lease_token = NULL, lease_until = NULL,
+                    version = version + 1, updated_at = clock_timestamp()
+                WHERE policy_id = %s AND archived_at IS NULL
+                  AND (lease_until IS NULL OR lease_until <= clock_timestamp())
+                """,
+                (policy_id,),
+            )
+            if cursor.rowcount != 1:
+                locked = connection.execute(
+                    "SELECT lease_until FROM lexsond.monitor_policies WHERE policy_id = %s",
+                    (policy_id,),
+                ).fetchone()
+                if (
+                    locked is not None
+                    and locked["lease_until"] is not None
+                    and locked["lease_until"] > datetime.now(UTC)
+                ):
+                    raise ControlPlaneConflict("monitor policy dispatch is already in progress")
+                _raise_monitor_update_conflict(connection, policy_id)
+        return self.get_monitor_policy(policy_id, include_archived=True)
+
+    def restore_monitor_policy(self, policy_id: str) -> dict[str, Any]:
+        with self._pool.connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE lexsond.monitor_policies
+                SET archived_at = NULL, version = version + 1,
+                    updated_at = clock_timestamp()
+                WHERE policy_id = %s AND archived_at IS NOT NULL
+                """,
+                (policy_id,),
+            )
+            if cursor.rowcount != 1:
+                row = connection.execute(
+                    "SELECT archived_at FROM lexsond.monitor_policies WHERE policy_id = %s",
+                    (policy_id,),
+                ).fetchone()
+                if row is None:
+                    raise ControlPlaneNotFound("monitor policy was not found")
+                raise ControlPlaneConflict("monitor policy is not archived")
+        return self.get_monitor_policy(policy_id, include_archived=True)
+
+    def purge_monitor_policy(self, policy_id: str) -> None:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                "SELECT archived_at FROM lexsond.monitor_policies WHERE policy_id = %s FOR UPDATE",
+                (policy_id,),
+            ).fetchone()
+            if row is None:
+                raise ControlPlaneNotFound("monitor policy was not found")
+            if row["archived_at"] is None:
+                raise ControlPlaneConflict("monitor policy must be archived before purge")
+            connection.execute(
+                "UPDATE lexsond.probe_runs SET monitor_policy_id = NULL WHERE monitor_policy_id = %s",
+                (policy_id,),
+            )
+            connection.execute(
+                "DELETE FROM lexsond.monitor_policies WHERE policy_id = %s",
+                (policy_id,),
+            )
+
+    def request_monitor_policy_run(self, policy_id: str) -> dict[str, Any]:
+        with self._pool.connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE lexsond.monitor_policies
+                SET next_run_at = clock_timestamp(), updated_at = clock_timestamp(),
+                    last_dispatch_failure_code = NULL
+                WHERE policy_id = %s AND archived_at IS NULL AND enabled
+                  AND (lease_until IS NULL OR lease_until <= clock_timestamp())
+                  AND NOT EXISTS (
+                      SELECT 1 FROM lexsond.probe_runs run
+                      WHERE run.run_id = monitor_policies.last_run_id
+                        AND run.state = 'RUNNING'
+                  )
+                """,
+                (policy_id,),
+            )
+            if cursor.rowcount != 1:
+                row = connection.execute(
+                    """
+                    SELECT policy.enabled, policy.archived_at, policy.lease_until,
+                           run.state AS last_run_state
+                    FROM lexsond.monitor_policies policy
+                    LEFT JOIN lexsond.probe_runs run ON run.run_id = policy.last_run_id
+                    WHERE policy.policy_id = %s
+                    """,
+                    (policy_id,),
+                ).fetchone()
+                if row is None or row["archived_at"] is not None:
+                    raise ControlPlaneNotFound("monitor policy was not found")
+                if row["lease_until"] is not None and row["lease_until"] > datetime.now(UTC):
+                    raise ControlPlaneConflict("monitor policy dispatch is already in progress")
+                if row["last_run_state"] == "RUNNING":
+                    raise ControlPlaneConflict("monitor policy already has a running probe")
+                raise ControlPlaneConflict("monitor policy is disabled")
+        return self.get_monitor_policy(policy_id)
+
+    def claim_due_monitor_policies(
+        self, *, now: str, limit: int, lease_seconds: float
+    ) -> list[dict[str, Any]]:
+        bounded = min(max(int(limit), 1), 32)
+        if lease_seconds <= 0 or lease_seconds > 300:
+            raise ValueError("monitor policy lease_seconds is out of bounds")
+        observed = datetime.fromisoformat(now)
+        if observed.tzinfo is None:
+            raise ValueError("monitor timestamps must include a timezone")
+        claims: list[dict[str, Any]] = []
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM lexsond.monitor_policies
+                WHERE enabled AND archived_at IS NULL
+                  AND next_run_at IS NOT NULL AND next_run_at <= %s
+                  AND (lease_until IS NULL OR lease_until <= %s)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM lexsond.probe_runs run
+                      WHERE run.run_id = monitor_policies.last_run_id
+                        AND run.state = 'RUNNING'
+                  )
+                ORDER BY next_run_at, policy_id
+                FOR UPDATE SKIP LOCKED LIMIT %s
+                """,
+                (observed, observed, bounded),
+            ).fetchall()
+            for row in rows:
+                token = str(uuid4())
+                connection.execute(
+                    """
+                    UPDATE lexsond.monitor_policies
+                    SET lease_token = %s, lease_until = %s
+                    WHERE policy_id = %s
+                    """,
+                    (token, observed + timedelta(seconds=lease_seconds), row["policy_id"]),
+                )
+                claim = _monitor_policy(row)
+                claim["lease_token"] = token
+                claim["scheduled_for"] = _time(row["next_run_at"])
+                claims.append(claim)
+        return claims
+
+    def complete_monitor_policy_dispatch(
+        self,
+        policy_id: str,
+        *,
+        lease_token: str,
+        scheduled_for: str,
+        run_id: str,
+    ) -> None:
+        self._finish_monitor_policy_dispatch(
+            policy_id,
+            lease_token=lease_token,
+            scheduled_for=scheduled_for,
+            run_id=run_id,
+            failure_code=None,
+        )
+
+    def fail_monitor_policy_dispatch(
+        self,
+        policy_id: str,
+        *,
+        lease_token: str,
+        scheduled_for: str,
+        failure_code: str,
+    ) -> None:
+        if not failure_code or len(failure_code) > 128 or not failure_code.replace("_", "").isalnum():
+            raise ValueError("invalid monitor dispatch failure code")
+        self._finish_monitor_policy_dispatch(
+            policy_id,
+            lease_token=lease_token,
+            scheduled_for=scheduled_for,
+            run_id=None,
+            failure_code=failure_code,
+        )
+
+    def _finish_monitor_policy_dispatch(
+        self,
+        policy_id: str,
+        *,
+        lease_token: str,
+        scheduled_for: str,
+        run_id: str | None,
+        failure_code: str | None,
+    ) -> None:
+        now = datetime.now(UTC)
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM lexsond.monitor_policies WHERE policy_id = %s FOR UPDATE",
+                (policy_id,),
+            ).fetchone()
+            if row is None:
+                raise ControlPlaneNotFound("monitor policy was not found")
+            if str(row["lease_token"]) != lease_token or _time(row["next_run_at"]) != scheduled_for:
+                raise ControlPlaneConflict("monitor policy dispatch lease is stale")
+            if run_id is not None:
+                linked = connection.execute(
+                    "SELECT monitor_policy_id FROM lexsond.probe_runs WHERE run_id = %s",
+                    (run_id,),
+                ).fetchone()
+                if linked is None or str(linked["monitor_policy_id"]) != policy_id:
+                    raise ControlPlaneConflict("monitor run does not match its policy")
+            connection.execute(
+                """
+                UPDATE lexsond.monitor_policies
+                SET next_run_at = %s, last_run_at = %s,
+                    last_run_id = COALESCE(%s, last_run_id),
+                    last_dispatch_failure_code = %s,
+                    lease_token = NULL, lease_until = NULL, updated_at = %s
+                WHERE policy_id = %s AND lease_token = %s
+                """,
+                (
+                    _next_schedule(
+                        scheduled_for,
+                        interval_seconds=int(row["interval_seconds"]),
+                        now=now,
+                    ),
+                    now,
+                    run_id,
+                    failure_code,
+                    now,
+                    policy_id,
+                    lease_token,
+                ),
+            )
+
+    def record_monitor_run(self, run_id: str) -> dict[str, Any] | None:
+        with self._pool.connection() as connection:
+            identity = connection.execute(
+                "SELECT monitor_policy_id FROM lexsond.probe_runs WHERE run_id = %s",
+                (run_id,),
+            ).fetchone()
+            if identity is None:
+                raise ControlPlaneNotFound("run was not found")
+            policy_id = identity["monitor_policy_id"]
+            if policy_id is None:
+                return None
+            policy_id = str(policy_id)
+            policy = connection.execute(
+                "SELECT * FROM lexsond.monitor_policies WHERE policy_id = %s FOR UPDATE",
+                (policy_id,),
+            ).fetchone()
+            if policy is None:
+                return None
+            run = connection.execute(
+                "SELECT * FROM lexsond.probe_runs WHERE run_id = %s FOR UPDATE",
+                (run_id,),
+            ).fetchone()
+            if run is None or str(run["monitor_policy_id"]) != policy_id:
+                return None
+            if run["state"] == "RUNNING":
+                raise ControlPlaneConflict("running monitor run cannot be projected")
+            existing = connection.execute(
+                "SELECT * FROM lexsond.monitor_samples WHERE run_id = %s", (run_id,)
+            ).fetchone()
+            if existing is not None:
+                state = connection.execute(
+                    "SELECT * FROM lexsond.monitor_states WHERE policy_id = %s",
+                    (policy_id,),
+                ).fetchone()
+                return {
+                    "sample": _monitor_sample(existing),
+                    "state": _monitor_state(state),
+                    "incident": None,
+                    "replayed": True,
+                }
+            observation = _monitor_observation(run)
+            result = dict(run["result_json"]) if run["result_json"] is not None else None
+            e2e_ms, ttft_ms, error_class = _monitor_metrics(result, run["failure_code"])
+            observed_at = run["finished_at"] or datetime.now(UTC)
+            sample_id = str(uuid4())
+            sample = connection.execute(
+                """
+                INSERT INTO lexsond.monitor_samples (
+                    sample_id, policy_id, run_id, observed_at, observation,
+                    error_class, p95_e2e_ms, p95_ttft_ms
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+                """,
+                (
+                    sample_id, policy_id, run_id, observed_at, observation.value,
+                    error_class, e2e_ms, ttft_ms,
+                ),
+            ).fetchone()
+            state_row = connection.execute(
+                "SELECT * FROM lexsond.monitor_states WHERE policy_id = %s FOR UPDATE",
+                (policy_id,),
+            ).fetchone()
+            if (
+                state_row is not None
+                and observed_at <= state_row["last_observed_at"]
+            ):
+                return {
+                    "sample": _monitor_sample(sample),
+                    "state": _monitor_state(state_row),
+                    "incident": None,
+                    "replayed": False,
+                    "stale": True,
+                }
+            previous = (
+                MonitorState(
+                    MonitorStatus(state_row["status"]),
+                    int(state_row["consecutive_successes"]),
+                    int(state_row["consecutive_failures"]),
+                )
+                if state_row is not None
+                else None
+            )
+            transitioned = transition_state(
+                previous,
+                observation,
+                failure_threshold=int(policy["failure_threshold"]),
+                recovery_threshold=int(policy["recovery_threshold"]),
+            )
+            state = connection.execute(
+                """
+                INSERT INTO lexsond.monitor_states (
+                    policy_id, status, consecutive_successes,
+                    consecutive_failures, last_observation, last_run_id,
+                    last_observed_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT(policy_id) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    consecutive_successes = EXCLUDED.consecutive_successes,
+                    consecutive_failures = EXCLUDED.consecutive_failures,
+                    last_observation = EXCLUDED.last_observation,
+                    last_run_id = EXCLUDED.last_run_id,
+                    last_observed_at = EXCLUDED.last_observed_at,
+                    updated_at = clock_timestamp()
+                RETURNING *
+                """,
+                (
+                    policy_id, transitioned.status.value,
+                    transitioned.consecutive_successes,
+                    transitioned.consecutive_failures, observation.value,
+                    run_id, observed_at,
+                ),
+            ).fetchone()
+            incident = None
+            if transitioned.event_type is not None:
+                from_status = (previous or MonitorState(MonitorStatus.UNKNOWN)).status.value
+                incident_row = connection.execute(
+                    """
+                    INSERT INTO lexsond.monitor_incident_events (
+                        incident_id, policy_id, run_id, event_type,
+                        from_status, to_status, error_class, observed_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    (
+                        str(uuid4()), policy_id, run_id, transitioned.event_type,
+                        from_status, transitioned.status.value, error_class, observed_at,
+                    ),
+                ).fetchone()
+                incident = _monitor_incident(incident_row)
+        return {
+            "sample": _monitor_sample(sample),
+            "state": _monitor_state(state),
+            "incident": incident,
+            "replayed": False,
+        }
+
+    def list_monitor_incidents(
+        self, *, policy_id: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        where, params = ("", []) if policy_id is None else ("WHERE policy_id = %s", [policy_id])
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM lexsond.monitor_incident_events {where}
+                ORDER BY observed_at DESC, incident_id DESC LIMIT %s
+                """,
+                (*params, min(max(int(limit), 1), 500)),
+            ).fetchall()
+        return [_monitor_incident(row) for row in rows]
+
+    def monitoring_overview(
+        self, *, window: str = "24h", include_archived: bool = False
+    ) -> dict[str, Any]:
+        window_seconds, bucket_seconds = _monitor_window(window)
+        now = datetime.now(UTC)
+        where = "" if include_archived else "WHERE p.archived_at IS NULL"
+        with self._pool.connection() as connection:
+            policies = connection.execute(
+                f"""
+                SELECT p.*, s.status, s.consecutive_successes,
+                       s.consecutive_failures, s.last_observation,
+                       s.last_observed_at
+                FROM lexsond.monitor_policies p
+                LEFT JOIN lexsond.monitor_states s ON s.policy_id = p.policy_id
+                {where}
+                ORDER BY p.name, p.policy_id
+                """
+            ).fetchall()
+            samples = connection.execute(
+                """
+                SELECT * FROM lexsond.monitor_samples
+                WHERE observed_at >= %s ORDER BY observed_at, sample_id
+                """,
+                (now - timedelta(seconds=window_seconds),),
+            ).fetchall()
+        grouped: dict[str, list[Mapping[str, Any]]] = {}
+        for sample in samples:
+            grouped.setdefault(str(sample["policy_id"]), []).append(sample)
+        status_counts = {name: 0 for name in ("unknown", "up", "degraded", "down")}
+        values: list[dict[str, Any]] = []
+        for policy in policies:
+            policy_id = str(policy["policy_id"])
+            status_value = policy["status"] or "UNKNOWN"
+            status_counts[status_value.lower()] += 1
+            policy_samples = grouped.get(policy_id, [])
+            latest = policy_samples[-1] if policy_samples else None
+            value = _monitor_policy(policy)
+            value.update(
+                {
+                    "status": status_value,
+                    "consecutive_successes": int(policy["consecutive_successes"] or 0),
+                    "consecutive_failures": int(policy["consecutive_failures"] or 0),
+                    "last_observation": policy["last_observation"],
+                    "last_observed_at": _time(policy["last_observed_at"]),
+                    "latest_error_class": latest["error_class"] if latest else None,
+                    "sample_count": len(policy_samples),
+                    "buckets": _aggregate_monitor_buckets(policy_samples, bucket_seconds),
+                }
+            )
+            values.append(value)
+        return {
+            "window": window,
+            "window_seconds": window_seconds,
+            "bucket_seconds": bucket_seconds,
+            "generated_at": now.isoformat(),
+            "timeline": _monitor_timeline(now, window_seconds, bucket_seconds),
+            "summary": {
+                "policies": len(policies),
+                **status_counts,
+                "samples": len(samples),
+            },
+            "policies": values,
+        }
+
+    def prune_monitoring_data(
+        self,
+        *,
+        samples_before: str,
+        incidents_before: str,
+        limit: int = 1000,
+    ) -> dict[str, int]:
+        sample_cutoff = _parse_utc(samples_before)
+        incident_cutoff = _parse_utc(incidents_before)
+        bounded = min(max(int(limit), 1), 10_000)
+        with self._pool.connection() as connection:
+            sample_cursor = connection.execute(
+                """
+                WITH doomed AS (
+                    SELECT sample_id FROM lexsond.monitor_samples
+                    WHERE observed_at < %s ORDER BY observed_at LIMIT %s
+                )
+                DELETE FROM lexsond.monitor_samples sample
+                USING doomed WHERE sample.sample_id = doomed.sample_id
+                """,
+                (sample_cutoff, bounded),
+            )
+            incident_cursor = connection.execute(
+                """
+                WITH doomed AS (
+                    SELECT incident_id FROM lexsond.monitor_incident_events
+                    WHERE observed_at < %s ORDER BY observed_at LIMIT %s
+                )
+                DELETE FROM lexsond.monitor_incident_events incident
+                USING doomed WHERE incident.incident_id = doomed.incident_id
+                """,
+                (incident_cutoff, bounded),
+            )
+        return {
+            "samples": max(sample_cursor.rowcount, 0),
+            "incidents": max(incident_cursor.rowcount, 0),
+        }
+
     # Runs and safe event stream
 
     def create_run(
@@ -847,15 +1505,47 @@ class PostgresControlPlaneStore:
                     ).fetchone()
                     if revision is None or revision["archived_at"] is not None:
                         raise ControlPlaneConflict("run suite revision is missing or archived")
+                policy_id = metadata.get("monitor_policy_id")
+                if policy_id is not None:
+                    policy = connection.execute(
+                        "SELECT * FROM lexsond.monitor_policies WHERE policy_id = %s FOR SHARE",
+                        (policy_id,),
+                    ).fetchone()
+                    if policy is None or policy["archived_at"] is not None:
+                        raise ControlPlaneConflict("monitor policy is missing or archived")
+                    expected = (
+                        str(policy["target_id"]),
+                        str(policy["suite_revision_id"])
+                        if policy["suite_revision_id"]
+                        else None,
+                        policy["run_kind"],
+                        policy["execution_backend"],
+                        policy["model"],
+                        policy["probe_type"],
+                        bool(policy["streaming"]),
+                        float(policy["timeout_seconds"]),
+                    )
+                    actual = (
+                        metadata.get("target_id"),
+                        metadata.get("suite_revision_id"),
+                        metadata.get("run_kind", "component"),
+                        metadata.get("execution_backend", "local"),
+                        metadata["model"],
+                        metadata["probe_type"],
+                        bool(metadata["stream"]),
+                        float(metadata["timeout_seconds"]),
+                    )
+                    if expected != actual:
+                        raise ControlPlaneConflict("monitor run does not match its policy snapshot")
                 connection.execute(
                     """
                     INSERT INTO lexsond.probe_runs (
                         run_id, idempotency_key, request_sha256,
-                        target_id, suite_revision_id, run_kind,
+                        target_id, suite_revision_id, monitor_policy_id, run_kind,
                         execution_backend, state, base_url, model, target_kind,
                         provider_id, run_mode, probe_type, streaming,
                         timeout_seconds, workflow_json
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'RUNNING', %s, %s, %s,
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'RUNNING', %s, %s, %s,
                               %s, %s, %s, %s, %s, %s)
                     """,
                     (
@@ -864,6 +1554,7 @@ class PostgresControlPlaneStore:
                         request_sha256,
                         metadata.get("target_id"),
                         metadata.get("suite_revision_id"),
+                        metadata.get("monitor_policy_id"),
                         metadata.get("run_kind", "component"),
                         metadata.get("execution_backend", "local"),
                         metadata["base_url"],
@@ -1066,6 +1757,16 @@ class PostgresControlPlaneStore:
                 raise ControlPlaneNotFound("run was not found")
             if row["state"] == "RUNNING" or row["archived_at"] is None:
                 raise ControlPlaneConflict("terminal run must be archived before purge")
+            if connection.execute(
+                "SELECT 1 FROM lexsond.monitor_states WHERE last_run_id = %s",
+                (run_id,),
+            ).fetchone() is not None or connection.execute(
+                "SELECT 1 FROM lexsond.monitor_policies WHERE last_run_id = %s",
+                (run_id,),
+            ).fetchone() is not None:
+                raise ControlPlaneConflict(
+                    "current monitor state run cannot be purged until a newer run is recorded"
+                )
             connection.execute(
                 "DELETE FROM lexsond.probe_runs WHERE run_id = %s", (run_id,)
             )
@@ -1269,6 +1970,9 @@ def _run(row: Mapping[str, Any], *, include_result: bool) -> dict[str, Any]:
         "suite_revision_id": (
             str(row["suite_revision_id"]) if row["suite_revision_id"] else None
         ),
+        "monitor_policy_id": (
+            str(row["monitor_policy_id"]) if row.get("monitor_policy_id") else None
+        ),
         "run_kind": row["run_kind"],
         "execution_backend": row["execution_backend"],
         "state": row["state"],
@@ -1277,7 +1981,7 @@ def _run(row: Mapping[str, Any], *, include_result: bool) -> dict[str, Any]:
         "finished_at": _time(row["finished_at"]),
         "archived_at": _time(row["archived_at"]),
         "failure_code": row["failure_code"],
-        "cancel_requested_at": row["cancel_requested_at"],
+        "cancel_requested_at": _time(row["cancel_requested_at"]),
         "config": {
             "base_url": row["base_url"],
             "model": row["model"],
@@ -1293,6 +1997,99 @@ def _run(row: Mapping[str, Any], *, include_result: bool) -> dict[str, Any]:
     if include_result:
         value["result"] = dict(row["result_json"]) if row["result_json"] else None
     return value
+
+
+def _monitor_policy(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(row["policy_id"]),
+        "name": row["name"],
+        "target_id": str(row["target_id"]),
+        "suite_revision_id": (
+            str(row["suite_revision_id"]) if row["suite_revision_id"] else None
+        ),
+        "run_kind": row["run_kind"],
+        "probe_type": row["probe_type"],
+        "execution_backend": row["execution_backend"],
+        "model": row["model"],
+        "stream": bool(row["streaming"]),
+        "timeout_seconds": float(row["timeout_seconds"]),
+        "interval_seconds": int(row["interval_seconds"]),
+        "failure_threshold": int(row["failure_threshold"]),
+        "recovery_threshold": int(row["recovery_threshold"]),
+        "schedule_offset_seconds": int(row["schedule_offset_seconds"]),
+        "enabled": bool(row["enabled"]),
+        "version": int(row["version"]),
+        "next_run_at": _time(row["next_run_at"]),
+        "last_run_at": _time(row["last_run_at"]),
+        "last_run_id": str(row["last_run_id"]) if row["last_run_id"] else None,
+        "last_dispatch_failure_code": row["last_dispatch_failure_code"],
+        "created_at": _time(row["created_at"]),
+        "updated_at": _time(row["updated_at"]),
+        "archived_at": _time(row["archived_at"]),
+    }
+
+
+def _monitor_sample(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(row["sample_id"]),
+        "policy_id": str(row["policy_id"]),
+        "run_id": str(row["run_id"]),
+        "observed_at": _time(row["observed_at"]),
+        "observation": row["observation"],
+        "error_class": row["error_class"],
+        "p95_e2e_ms": row["p95_e2e_ms"],
+        "p95_ttft_ms": row["p95_ttft_ms"],
+    }
+
+
+def _monitor_state(row: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {
+        "policy_id": str(row["policy_id"]),
+        "status": row["status"],
+        "consecutive_successes": int(row["consecutive_successes"]),
+        "consecutive_failures": int(row["consecutive_failures"]),
+        "last_observation": row["last_observation"],
+        "last_run_id": str(row["last_run_id"]),
+        "last_observed_at": _time(row["last_observed_at"]),
+        "updated_at": _time(row["updated_at"]),
+    }
+
+
+def _monitor_incident(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(row["incident_id"]),
+        "policy_id": str(row["policy_id"]),
+        "run_id": str(row["run_id"]),
+        "event_type": row["event_type"],
+        "from_status": row["from_status"],
+        "to_status": row["to_status"],
+        "error_class": row["error_class"],
+        "observed_at": _time(row["observed_at"]),
+    }
+
+
+def _require_monitor_references(connection: Any, value: Mapping[str, Any]) -> None:
+    target = connection.execute(
+        "SELECT archived_at FROM lexsond.targets WHERE target_id = %s FOR SHARE",
+        (str(value["target_id"]),),
+    ).fetchone()
+    if target is None or target["archived_at"] is not None:
+        raise ControlPlaneConflict("monitor target is missing or archived")
+    revision_id = value.get("suite_revision_id")
+    if revision_id is None:
+        return
+    revision = connection.execute(
+        """
+        SELECT s.archived_at FROM lexsond.suite_revisions r
+        JOIN lexsond.suites s ON s.suite_id = r.suite_id
+        WHERE r.revision_id = %s FOR SHARE OF r, s
+        """,
+        (str(revision_id),),
+    ).fetchone()
+    if revision is None or revision["archived_at"] is not None:
+        raise ControlPlaneConflict("monitor suite revision is missing or archived")
 
 
 def _suite_document(value: Any) -> dict[str, Any]:
@@ -1323,6 +2120,18 @@ def _raise_target_update_conflict(connection: Any, target_id: str) -> None:
     if row["archived_at"] is not None:
         raise ControlPlaneConflict("archived target cannot be updated")
     raise ControlPlaneConflict("resource version is stale")
+
+
+def _raise_monitor_update_conflict(connection: Any, policy_id: str) -> None:
+    row = connection.execute(
+        "SELECT archived_at FROM lexsond.monitor_policies WHERE policy_id = %s",
+        (policy_id,),
+    ).fetchone()
+    if row is None:
+        raise ControlPlaneNotFound("monitor policy was not found")
+    if row["archived_at"] is not None:
+        raise ControlPlaneConflict("archived monitor policy cannot be updated")
+    raise ControlPlaneConflict("monitor policy version is stale")
 
 
 def _raise_agent_update_conflict(connection: Any, session_id: str) -> None:

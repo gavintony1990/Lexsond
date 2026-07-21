@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import socket
 import sqlite3
 import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage, HumanMessage
@@ -159,6 +161,31 @@ class AgentCoordinatorTests(unittest.TestCase):
 
         self.assertNotIn(secret, repr(model))
         self.assertNotIn(secret, str(model.model_dump()))
+
+    def test_agent_chat_model_blocks_private_dns_before_socket_creation(self) -> None:
+        model = OpenAICompatibleAgentModel(
+            base_url="https://api.example.com/v1",
+            api_key=None,
+            model="chat-model",
+            timeout_seconds=5,
+        )
+        private_answer = [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("169.254.169.254", 443),
+            )
+        ]
+        with (
+            mock.patch("lexsond.probe.socket.getaddrinfo", return_value=private_answer),
+            mock.patch("lexsond.probe.socket.socket") as socket_factory,
+            self.assertRaisesRegex(AgentModelError, "blocked network") as raised,
+        ):
+            model._request({"model": "chat-model", "messages": []})
+        self.assertEqual(raised.exception.code, "TARGET_ADDRESS_BLOCKED")
+        socket_factory.assert_not_called()
 
     def test_agent_chat_model_parses_tool_calls_through_langchain_once(self) -> None:
         payloads = []

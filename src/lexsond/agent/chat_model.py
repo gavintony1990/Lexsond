@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import socket
+import ssl
+import time
 from collections.abc import Callable, Sequence
 from typing import Any
+from urllib.parse import urlsplit
 
-import httpx
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
@@ -19,7 +22,14 @@ from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import PrivateAttr
 
-from ..probe import validate_api_key_value, validate_base_url_transport
+from ..probe import (
+    UnsafeTargetAddress,
+    _create_guarded_http_connection,
+    _set_connection_deadline_timeout,
+    _wrap_connection_with_deadline,
+    validate_api_key_value,
+    validate_base_url_transport,
+)
 from ..storage.redaction import redact_text, redact_value
 
 
@@ -156,46 +166,57 @@ class OpenAICompatibleAgentModel(BaseChatModel):
         headers = {"Accept": "application/json", "Content-Type": "application/json"}
         if self._api_key is not None:
             headers["Authorization"] = f"Bearer {self._api_key}"
+        parsed = urlsplit(self._base_url)
+        connection = _create_guarded_http_connection(parsed, self._timeout_seconds)
+        path = f"{parsed.path.rstrip('/')}/chat/completions"
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+        deadline_ns = time.perf_counter_ns() + int(
+            self._timeout_seconds * 1_000_000_000
+        )
         try:
-            with httpx.Client(
-                timeout=httpx.Timeout(self._timeout_seconds),
-                follow_redirects=False,
-                trust_env=False,
-            ) as client:
-                with client.stream(
-                    "POST",
-                    f"{self._base_url}/chat/completions",
-                    headers=headers,
-                    json=payload,
-                ) as response:
-                    if response.status_code != 200:
-                        mapped = {
-                            401: ("AGENT_MODEL_AUTHENTICATION_FAILED", 401),
-                            402: ("AGENT_MODEL_PAYMENT_REQUIRED", 402),
-                            403: ("AGENT_MODEL_AUTHORIZATION_FAILED", 403),
-                            404: ("AGENT_MODEL_NOT_FOUND", 404),
-                            429: ("AGENT_MODEL_RATE_LIMITED", 429),
-                        }.get(response.status_code, ("AGENT_MODEL_UPSTREAM_ERROR", 502))
-                        raise AgentModelError(
-                            f"Agent model request failed with HTTP {response.status_code}",
-                            code=mapped[0],
-                            http_status=mapped[1],
-                        )
-                    content = bytearray()
-                    for chunk in response.iter_bytes():
-                        content.extend(chunk)
-                        if len(content) > 2 * 1024 * 1024:
-                            raise AgentModelError("Agent model response exceeded the safe limit")
+            connection.request("POST", path, body=body, headers=headers)
+            _wrap_connection_with_deadline(connection, deadline_ns)
+            response = connection.getresponse()
+            if response.status != 200:
+                mapped = {
+                    401: ("AGENT_MODEL_AUTHENTICATION_FAILED", 401),
+                    402: ("AGENT_MODEL_PAYMENT_REQUIRED", 402),
+                    403: ("AGENT_MODEL_AUTHORIZATION_FAILED", 403),
+                    404: ("AGENT_MODEL_NOT_FOUND", 404),
+                    429: ("AGENT_MODEL_RATE_LIMITED", 429),
+                }.get(response.status, ("AGENT_MODEL_UPSTREAM_ERROR", 502))
+                raise AgentModelError(
+                    f"Agent model request failed with HTTP {response.status}",
+                    code=mapped[0],
+                    http_status=mapped[1],
+                )
+            content = bytearray()
+            while True:
+                _set_connection_deadline_timeout(connection, deadline_ns)
+                chunk = response.read1(65_536)
+                if not chunk:
+                    break
+                content.extend(chunk)
+                if len(content) > 2 * 1024 * 1024:
+                    raise AgentModelError("Agent model response exceeded the safe limit")
         except AgentModelError:
             raise
-        except httpx.TimeoutException as exc:
+        except UnsafeTargetAddress as exc:
+            raise AgentModelError(
+                "Agent model target resolved to a blocked network",
+                code="TARGET_ADDRESS_BLOCKED",
+                http_status=422,
+            ) from exc
+        except (TimeoutError, socket.timeout) as exc:
             raise AgentModelError(
                 "Agent model request timed out",
                 code="AGENT_MODEL_TIMEOUT",
                 http_status=504,
             ) from exc
-        except httpx.HTTPError as exc:
+        except (ConnectionError, socket.gaierror, ssl.SSLError, OSError) as exc:
             raise AgentModelError("Agent model request could not reach the target") from exc
+        finally:
+            connection.close()
         try:
             value = json.loads(content)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:

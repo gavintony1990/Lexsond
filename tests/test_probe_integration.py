@@ -75,6 +75,29 @@ class ProbeIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(measurement.e2e_ms)
         self.assertGreaterEqual(measurement.chunk_count, 5)
 
+    def test_dynamic_expected_text_detects_fixed_or_replayed_output(self) -> None:
+        matching = OpenAIChatProbe(
+            ProbeConfig(
+                base_url=self.base_url,
+                api_key="test-key",
+                model="mock-model",
+                stream=True,
+                expected_text="PROBE_OK",
+            )
+        ).run()
+        replayed = OpenAIChatProbe(
+            ProbeConfig(
+                base_url=self.base_url,
+                api_key="test-key",
+                model="mock-model",
+                stream=True,
+                expected_text="LEXSOND_RESULT=123",
+            )
+        ).run()
+        self.assertEqual(matching.status, RunStatus.PASS)
+        self.assertEqual(replayed.status, RunStatus.FAIL)
+        self.assertIn("EXPECTED_TEXT_ASSERTION_FAILED", replayed.reason_codes)
+
     def test_each_multimodal_component_emits_ordered_progress(self) -> None:
         scenarios = (
             (ProbeType.CHAT, True, None),
@@ -355,7 +378,11 @@ class ProbeIntegrationTests(unittest.TestCase):
         self.assertEqual(result.status, RunStatus.PASS)
         self.assertEqual(measurement.evidence["probe_type"], "embedding")
         self.assertEqual(measurement.evidence["embedding_dimensions"], 4)
-        self.assertNotIn("0.125", serialized)
+        # Assert the wire-shape key is absent. A vector value such as 0.125 can
+        # legitimately equal a millisecond timing field and is not a safe
+        # string-level sentinel for disclosure.
+        self.assertNotIn('"embedding": [', serialized)
+        self.assertEqual(measurement.output_text, "")
 
     def test_image_generation_probe_keeps_only_output_metadata(self) -> None:
         result = run_openai_probe(

@@ -11,6 +11,8 @@ from typing import Any, Mapping, Protocol, Sequence
 from uuid import uuid4
 
 from ..agent.service import AgentCoordinator
+from ..monitoring.scheduler import MonitorScheduler
+from ..monitoring.challenge import ArithmeticChallenge, arithmetic_challenge
 from ..probe import ProbeConfig, ProbeType, validate_api_key_value
 from ..probe_components import (
     ComponentStepStatus,
@@ -27,7 +29,15 @@ from ..storage.runtime_contracts import canonical_json_bytes, validate_sanitized
 from ..suite import ProbeSuite, compile_suite, load_suite_json, run_suite
 from ..targets import fetch_model_catalog_entries
 from ..workflows import WorkflowEvent, WorkflowEventType
-from .api_models import RunCreate, SuiteCreate, SuitePatch, TargetCreate, TargetPatch
+from .api_models import (
+    MonitorPolicyCreate,
+    MonitorPolicyPatch,
+    RunCreate,
+    SuiteCreate,
+    SuitePatch,
+    TargetCreate,
+    TargetPatch,
+)
 from .control_store import ControlPlaneConflict, ControlPlaneStore
 from .langchain_runtime import invoke_native_probe
 
@@ -88,6 +98,9 @@ class ControlPlaneService:
         temporal_launcher: TemporalLauncher | None = None,
         store: Any | None = None,
         agent_model_factory: Any | None = None,
+        monitor_scheduler: bool = True,
+        monitor_sample_retention_days: int = 30,
+        monitor_incident_retention_days: int = 365,
     ) -> None:
         if store is None and database_path is None:
             raise ValueError("database_path is required when store is not provided")
@@ -106,8 +119,19 @@ class ControlPlaneService:
         self._cancel_signals: dict[str, threading.Event] = {}
         self._cancel_lock = threading.Lock()
         self._recover_temporal_runs()
+        scheduler_available = callable(
+            getattr(self.store, "claim_due_monitor_policies", None)
+        )
+        self.monitor_scheduler = MonitorScheduler(
+            self.store,
+            self._dispatch_monitor_policy,
+            enabled=monitor_scheduler and scheduler_available,
+            sample_retention_days=monitor_sample_retention_days,
+            incident_retention_days=monitor_incident_retention_days,
+        )
 
     def close(self) -> None:
+        self.monitor_scheduler.close()
         self.executor.shutdown(wait=True, cancel_futures=False)
         self.temporal.close()
         close_store = getattr(self.store, "close", None)
@@ -142,11 +166,16 @@ class ControlPlaneService:
         runs = self.store.list_runs(limit=100)
         terminal = [run for run in runs if run["state"] != "RUNNING"]
         passed = [run for run in terminal if run["result_status"] == "PASS"]
+        monitor_policies = (
+            self.store.list_monitor_policies()
+            if callable(getattr(self.store, "list_monitor_policies", None))
+            else []
+        )
         return {
             "product": {
                 "name": "Lexsond",
                 "english_name": "Lexsond · 码海测深",
-                "version": "0.7.0",
+                "version": "0.8.0",
             },
             "execution_backends": [
                 {"id": "local", "available": True, "status": "READY"},
@@ -178,6 +207,7 @@ class ControlPlaneService:
                 "targets": len(self.store.list_targets()),
                 "suites": len(self.store.list_suites()),
                 "agent_sessions": len(self.store.list_agent_sessions()),
+                "monitor_policies": len(monitor_policies),
             },
         }
 
@@ -240,6 +270,119 @@ class ControlPlaneService:
             expected_version=patch.version,
         )
 
+    # Continuous monitoring
+
+    def create_monitor_policy(self, model: MonitorPolicyCreate) -> dict[str, Any]:
+        value = self._validated_monitor_policy(model)
+        policy = self.store.create_monitor_policy(value)
+        self.monitor_scheduler.wake()
+        return policy
+
+    def update_monitor_policy(
+        self, policy_id: str, patch: MonitorPolicyPatch
+    ) -> dict[str, Any]:
+        current = self.store.get_monitor_policy(policy_id)
+        fields = patch.model_fields_set - {"version"}
+        changes = {field: getattr(patch, field) for field in fields}
+        merged = {
+            "name": changes.get("name", current["name"]),
+            "target_id": changes.get("target_id", current["target_id"]),
+            "run_kind": changes.get("run_kind", current["run_kind"]),
+            "probe_type": changes.get("probe_type", current["probe_type"]),
+            "suite_revision_id": changes.get(
+                "suite_revision_id", current["suite_revision_id"]
+            ),
+            "execution_backend": changes.get(
+                "execution_backend", current["execution_backend"]
+            ),
+            "model": changes.get("model", current["model"]),
+            "stream": changes.get("stream", current["stream"]),
+            "timeout_seconds": changes.get(
+                "timeout_seconds", current["timeout_seconds"]
+            ),
+            "interval_seconds": changes.get(
+                "interval_seconds", current["interval_seconds"]
+            ),
+            "failure_threshold": changes.get(
+                "failure_threshold", current["failure_threshold"]
+            ),
+            "recovery_threshold": changes.get(
+                "recovery_threshold", current["recovery_threshold"]
+            ),
+            "enabled": changes.get("enabled", current["enabled"]),
+        }
+        validated = self._validated_monitor_policy(
+            MonitorPolicyCreate.model_validate(merged)
+        )
+        normalized = {field: validated[field] for field in fields}
+        policy = self.store.update_monitor_policy(
+            policy_id,
+            normalized,
+            expected_version=patch.version,
+        )
+        self.monitor_scheduler.wake()
+        return policy
+
+    def request_monitor_policy_run(self, policy_id: str) -> dict[str, Any]:
+        policy = self.store.request_monitor_policy_run(policy_id)
+        self.monitor_scheduler.wake()
+        return policy
+
+    def _validated_monitor_policy(
+        self, model: MonitorPolicyCreate
+    ) -> dict[str, Any]:
+        target = self.store.get_target(str(model.target_id))
+        if model.execution_backend == "local" and target["target_kind"] == "cloud":
+            raise ValueError(
+                "recurring local execution cannot store a cloud API key; use Temporal credential_ref"
+            )
+        if model.execution_backend == "temporal":
+            if not self.temporal.available:
+                raise TemporalUnavailable("Temporal backend is not configured")
+            if not target["credential_ref_configured"]:
+                raise ValueError("Temporal monitor policy requires target credential_ref")
+        suite = None
+        if model.suite_revision_id is not None:
+            revision = self.store.get_suite_revision(str(model.suite_revision_id))
+            suite = compile_suite(revision["document"])
+        model_name = (model.model or target["default_model"]).strip()
+        if not model_name:
+            raise ValueError("model is required")
+        value = model.model_dump(mode="json")
+        value["target_id"] = target["id"]
+        value["suite_revision_id"] = (
+            str(model.suite_revision_id) if model.suite_revision_id is not None else None
+        )
+        value["probe_type"] = (model.probe_type or ProbeType.CHAT).value
+        value["model"] = model_name
+        if suite is not None:
+            value["stream"] = suite.request.stream
+            value["timeout_seconds"] = suite.sampling.timeout_seconds
+        return value
+
+    def _dispatch_monitor_policy(
+        self, policy: Mapping[str, Any], idempotency_key: str
+    ) -> str:
+        model = RunCreate.model_validate(
+            {
+                "target_id": policy["target_id"],
+                "run_kind": policy["run_kind"],
+                "probe_type": policy["probe_type"],
+                "suite_revision_id": policy["suite_revision_id"],
+                "execution_backend": policy["execution_backend"],
+                "model": policy["model"],
+                "stream": policy["stream"],
+                "timeout_seconds": policy["timeout_seconds"],
+                "api_key": None,
+            }
+        )
+        run = self.start_run(
+            model,
+            idempotency_key=idempotency_key,
+            monitor_policy_id=policy["id"],
+        )
+        return run["run_id"]
+
     # Runs
 
     def start_run(
@@ -247,6 +390,7 @@ class ControlPlaneService:
         model: RunCreate,
         *,
         idempotency_key: str | None = None,
+        monitor_policy_id: str | None = None,
     ) -> dict[str, Any]:
         target = self.store.get_target(str(model.target_id))
         api_key = model.api_key.get_secret_value() if model.api_key is not None else None
@@ -281,7 +425,7 @@ class ControlPlaneService:
             model=model_name,
             provider_id=target.get("provider_id"),
         )
-        if model.execution_backend == "temporal":
+        if model.execution_backend == "temporal" or monitor_policy_id is not None:
             audio_voice, binding_source = None, "MANUAL_CONFIRMATION"
         else:
             audio_voice, binding_source = self._preflight_binding(
@@ -292,6 +436,13 @@ class ControlPlaneService:
             )
         _reject_secret_in_durable_run_fields(api_key, audio_voice=audio_voice)
         run_id = str(uuid4())
+        challenge = (
+            arithmetic_challenge(idempotency_key or run_id)
+            if monitor_policy_id is not None
+            and model.run_kind == "component"
+            and probe_type == ProbeType.CHAT
+            else None
+        )
         run_mode = "canary" if model.run_kind == "suite" else "single"
         workflow = (
             _create_temporal_workflow(occurred_at=_now())
@@ -306,6 +457,7 @@ class ControlPlaneService:
         metadata = {
             "target_id": target["id"],
             "suite_revision_id": suite_revision_id,
+            "monitor_policy_id": monitor_policy_id,
             "run_kind": model.run_kind,
             "execution_backend": model.execution_backend,
             "base_url": target["base_url"],
@@ -338,6 +490,7 @@ class ControlPlaneService:
                 model_name=model_name,
                 stream=model.stream,
                 timeout_seconds=model.timeout_seconds,
+                challenge=challenge,
             )
             try:
                 self.temporal.start(
@@ -359,6 +512,7 @@ class ControlPlaneService:
                 metadata,
                 suite,
                 signal,
+                challenge,
             )
         return self.store.get_run(run_id)
 
@@ -369,7 +523,9 @@ class ControlPlaneService:
             if signal is not None:
                 signal.set()
         if run["execution_backend"] != "temporal":
-            return self.store.cancel_run(run_id)
+            cancelled = self.store.cancel_run(run_id)
+            self._project_monitor_run(run_id)
+            return cancelled
         intent = self.store.request_cancel_run(run_id)
         try:
             dispatched = self.temporal.cancel(run_id)
@@ -401,6 +557,7 @@ class ControlPlaneService:
     def _confirm_temporal_cancel(self, run_id: str) -> dict[str, Any]:
         try:
             cancelled = self.store.cancel_run(run_id)
+            self._project_monitor_run(run_id)
         except ControlPlaneConflict:
             return self.store.get_run(run_id, include_archived=True)
         finally:
@@ -415,6 +572,7 @@ class ControlPlaneService:
         metadata: Mapping[str, Any],
         suite: ProbeSuite | None,
         cancel_signal: threading.Event,
+        challenge: ArithmeticChallenge | None = None,
     ) -> None:
         evidence_started = False
         try:
@@ -444,6 +602,16 @@ class ControlPlaneService:
                             probe_type=ProbeType(metadata["probe_type"]),
                             provider_id=metadata["provider_id"],
                             audio_voice=metadata.get("audio_voice"),
+                            prompt=(
+                                challenge.prompt
+                                if challenge is not None
+                                else "Reply with exactly: PROBE_OK"
+                            ),
+                            expected_text=(
+                                challenge.expected_text
+                                if challenge is not None
+                                else None
+                            ),
                         ),
                         progress=recorder.emit,
                     )
@@ -475,6 +643,7 @@ class ControlPlaneService:
                 occurred_at=_now(),
             )
             self.store.complete_run(run_id, sanitized, final_workflow)
+            self._project_monitor_run(run_id)
         except Exception:
             try:
                 current = self.store.get_run(run_id, include_archived=True)
@@ -497,11 +666,13 @@ class ControlPlaneService:
                 current["workflow"], status="FAIL", failure_code=code
             )
             self.store.fail_run(run_id, code, workflow)
+            self._project_monitor_run(run_id)
             return
         workflow = fail_component_run(
             current["workflow"], failure_code=code, occurred_at=_now()
         )
         self.store.fail_run(run_id, code, workflow)
+        self._project_monitor_run(run_id)
 
     def _record_temporal_events(
         self, run_id: str, events: Sequence[WorkflowEvent]
@@ -545,11 +716,29 @@ class ControlPlaneService:
                     current["workflow"], status=str(result.get("status", "UNKNOWN"))
                 )
                 self.store.complete_run(run_id, result, workflow)
+                self._project_monitor_run(run_id)
                 return
             self._mark_failed(run_id, failure_code or "TEMPORAL_WORKFLOW_FAILED")
         finally:
             with self._cancel_lock:
                 self._cancel_signals.pop(run_id, None)
+
+    def _project_monitor_run(self, run_id: str) -> None:
+        project = getattr(self.store, "record_monitor_run", None)
+        if not callable(project):
+            return
+        try:
+            project(run_id)
+        except Exception:
+            try:
+                self.store.append_run_event(
+                    run_id,
+                    event_type="MONITOR_PROJECTION_FAILED",
+                    phase="monitoring",
+                    status="FAIL",
+                )
+            except Exception:
+                pass
 
     def _advance(
         self, run_id: str, step_id: str, status: ComponentStepStatus
@@ -678,7 +867,11 @@ def _component_result_view(result: Any) -> dict[str, Any]:
 
 
 def _single_chat_suite_document(
-    *, model_name: str, stream: bool, timeout_seconds: float
+    *,
+    model_name: str,
+    stream: bool,
+    timeout_seconds: float,
+    challenge: ArithmeticChallenge | None = None,
 ) -> dict[str, Any]:
     del model_name
     return {
@@ -689,7 +882,11 @@ def _single_chat_suite_document(
             "layer": "L1",
             "protocol": "openai-chat",
             "request": {
-                "prompt": "Reply with exactly: PROBE_OK",
+                "prompt": (
+                    challenge.prompt
+                    if challenge is not None
+                    else "Reply with exactly: PROBE_OK"
+                ),
                 "stream": stream,
                 "max_output_tokens": 64,
             },
@@ -703,6 +900,11 @@ def _single_chat_suite_document(
             "assertions": [
                 {"type": "http_status", "equals": 200},
                 {"type": "output_nonempty"},
+                *(
+                    [{"type": "exact_text", "equals": challenge.expected_text}]
+                    if challenge is not None
+                    else []
+                ),
             ],
         },
     }

@@ -222,7 +222,7 @@ class ControlPlaneStoreTests(unittest.TestCase):
                     "SELECT version FROM control_schema_migrations ORDER BY version"
                 )
             ]
-        self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8])
 
     @staticmethod
     def _suite_document(version: str, *, requests: int) -> dict[str, object]:

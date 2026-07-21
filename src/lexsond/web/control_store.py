@@ -11,6 +11,12 @@ from typing import Any, Mapping
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+from ..monitoring.state import (
+    MonitorObservation,
+    MonitorState,
+    MonitorStatus,
+    transition_state,
+)
 from ..storage.redaction import redact_text, redact_value
 from ..suite import compile_suite
 
@@ -159,6 +165,11 @@ class ControlPlaneStore:
             ).fetchone()
             if agent_reference is not None:
                 raise ControlPlaneConflict("target is referenced by an Agent session")
+            if connection.execute(
+                "SELECT 1 FROM monitor_policies WHERE target_id = ? LIMIT 1",
+                (target_id,),
+            ).fetchone() is not None:
+                raise ControlPlaneConflict("target is referenced by a monitor policy")
             connection.execute("DELETE FROM control_targets WHERE target_id = ?", (target_id,))
 
     # Suites and immutable revisions
@@ -360,6 +371,15 @@ class ControlPlaneStore:
             ).fetchone()
             if referenced is not None:
                 raise ControlPlaneConflict("suite is referenced by a run")
+            if connection.execute(
+                """
+                SELECT 1 FROM monitor_policies p
+                JOIN control_suite_revisions sr ON sr.revision_id = p.suite_revision_id
+                WHERE sr.suite_id = ? LIMIT 1
+                """,
+                (suite_id,),
+            ).fetchone() is not None:
+                raise ControlPlaneConflict("suite is referenced by a monitor policy")
             connection.execute("DELETE FROM control_suite_revisions WHERE suite_id = ?", (suite_id,))
             connection.execute("DELETE FROM control_suites WHERE suite_id = ?", (suite_id,))
 
@@ -826,6 +846,646 @@ class ControlPlaneStore:
             ).fetchall()
         return [self._agent_event(row) for row in rows]
 
+    # Continuous monitoring policies and derived health state
+
+    def create_monitor_policy(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        _validate_monitor_policy_value(value)
+        policy_id = str(uuid4())
+        now = datetime.now(UTC)
+        interval = int(value["interval_seconds"])
+        offset = _schedule_offset(policy_id, interval)
+        next_run_at = (
+            (now + timedelta(seconds=offset)).isoformat()
+            if bool(value.get("enabled", True))
+            else None
+        )
+        try:
+            with self._session() as connection:
+                _require_monitor_references(connection, value)
+                connection.execute(
+                    """
+                    INSERT INTO monitor_policies (
+                        policy_id, name, target_id, suite_revision_id, run_kind,
+                        probe_type, execution_backend, model, streaming,
+                        timeout_seconds, interval_seconds, failure_threshold,
+                        recovery_threshold, schedule_offset_seconds, enabled,
+                        version, next_run_at, last_run_at, last_run_id,
+                        last_dispatch_failure_code, lease_token, lease_until,
+                        created_at, updated_at, archived_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1,
+                              ?, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL)
+                    """,
+                    (
+                        policy_id,
+                        value["name"],
+                        str(value["target_id"]),
+                        _optional_text(value.get("suite_revision_id")),
+                        value["run_kind"],
+                        str(value.get("probe_type") or "chat"),
+                        value["execution_backend"],
+                        value["model"],
+                        1 if value["stream"] else 0,
+                        float(value["timeout_seconds"]),
+                        interval,
+                        int(value["failure_threshold"]),
+                        int(value["recovery_threshold"]),
+                        offset,
+                        1 if value.get("enabled", True) else 0,
+                        next_run_at,
+                        now.isoformat(),
+                        now.isoformat(),
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ControlPlaneConflict("monitor policy conflicts with stored data") from exc
+        return self.get_monitor_policy(policy_id, include_archived=True)
+
+    def get_monitor_policy(
+        self, policy_id: str, *, include_archived: bool = False
+    ) -> dict[str, Any]:
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT * FROM monitor_policies WHERE policy_id = ?", (policy_id,)
+            ).fetchone()
+        if row is None or (row["archived_at"] is not None and not include_archived):
+            raise ControlPlaneNotFound("monitor policy was not found")
+        return self._monitor_policy(row)
+
+    def list_monitor_policies(
+        self, *, include_archived: bool = False
+    ) -> list[dict[str, Any]]:
+        where = "" if include_archived else "WHERE archived_at IS NULL"
+        with self._session() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM monitor_policies {where} ORDER BY updated_at DESC, policy_id"
+            ).fetchall()
+        return [self._monitor_policy(row) for row in rows]
+
+    def update_monitor_policy(
+        self,
+        policy_id: str,
+        changes: Mapping[str, Any],
+        *,
+        expected_version: int,
+    ) -> dict[str, Any]:
+        if not changes:
+            return self.get_monitor_policy(policy_id, include_archived=True)
+        allowed = {
+            "name", "target_id", "suite_revision_id", "run_kind", "probe_type",
+            "execution_backend", "model", "stream", "timeout_seconds",
+            "interval_seconds", "failure_threshold", "recovery_threshold", "enabled",
+        }
+        if set(changes) - allowed:
+            raise ValueError("monitor policy update contains unknown fields")
+        current = self.get_monitor_policy(policy_id, include_archived=True)
+        if current["archived_at"] is not None:
+            raise ControlPlaneConflict("archived monitor policy cannot be updated")
+        merged = {**current, **changes}
+        _validate_monitor_policy_value(merged)
+        interval = int(merged["interval_seconds"])
+        offset = _schedule_offset(policy_id, interval)
+        now = datetime.now(UTC)
+        normalized = {
+            field: (
+                str(value)
+                if field in {"target_id", "suite_revision_id", "probe_type"} and value is not None
+                else (1 if bool(value) else 0)
+                if field in {"stream", "enabled"}
+                else value
+            )
+            for field, value in changes.items()
+        }
+        if "interval_seconds" in changes:
+            normalized["schedule_offset_seconds"] = offset
+        schedule_changed = bool({"enabled", "interval_seconds"} & set(changes))
+        if schedule_changed:
+            normalized["next_run_at"] = (
+                (now + timedelta(seconds=offset)).isoformat()
+                if bool(merged["enabled"])
+                else None
+            )
+            normalized["lease_token"] = None
+            normalized["lease_until"] = None
+        assignments = [f"{field} = ?" for field in normalized]
+        params = [*normalized.values(), now.isoformat(), policy_id, expected_version]
+        try:
+            with self._session() as connection:
+                _require_monitor_references(connection, merged)
+                cursor = connection.execute(
+                    f"""
+                    UPDATE monitor_policies
+                    SET {', '.join(assignments)}, version = version + 1, updated_at = ?
+                    WHERE policy_id = ? AND version = ? AND archived_at IS NULL
+                      AND (lease_until IS NULL OR lease_until <= ?)
+                    """,
+                    (*params, now.isoformat()),
+                )
+                if cursor.rowcount != 1:
+                    locked = connection.execute(
+                        "SELECT lease_until FROM monitor_policies WHERE policy_id = ?",
+                        (policy_id,),
+                    ).fetchone()
+                    if (
+                        locked is not None
+                        and locked["lease_until"] is not None
+                        and locked["lease_until"] > now.isoformat()
+                    ):
+                        raise ControlPlaneConflict(
+                            "monitor policy dispatch is already in progress"
+                        )
+                    self._raise_missing_or_version(
+                        connection, "monitor_policies", "policy_id", policy_id
+                    )
+        except sqlite3.IntegrityError as exc:
+            raise ControlPlaneConflict("monitor policy update conflicts with stored data") from exc
+        return self.get_monitor_policy(policy_id, include_archived=True)
+
+    def archive_monitor_policy(self, policy_id: str) -> dict[str, Any]:
+        now = _now()
+        with self._session() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE monitor_policies SET archived_at = ?, enabled = 0,
+                    next_run_at = NULL, lease_token = NULL, lease_until = NULL,
+                    version = version + 1, updated_at = ?
+                WHERE policy_id = ? AND archived_at IS NULL
+                  AND (lease_until IS NULL OR lease_until <= ?)
+                """,
+                (now, now, policy_id, now),
+            )
+            if cursor.rowcount != 1:
+                row = connection.execute(
+                    "SELECT lease_until FROM monitor_policies WHERE policy_id = ?", (policy_id,)
+                ).fetchone()
+                if row is None:
+                    raise ControlPlaneNotFound("monitor policy was not found")
+                if row["lease_until"] is not None and row["lease_until"] > now:
+                    raise ControlPlaneConflict("monitor policy dispatch is already in progress")
+                raise ControlPlaneConflict("monitor policy is already archived")
+        return self.get_monitor_policy(policy_id, include_archived=True)
+
+    def restore_monitor_policy(self, policy_id: str) -> dict[str, Any]:
+        now = _now()
+        with self._session() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE monitor_policies SET archived_at = NULL,
+                    version = version + 1, updated_at = ?
+                WHERE policy_id = ? AND archived_at IS NOT NULL
+                """,
+                (now, policy_id),
+            )
+            if cursor.rowcount != 1:
+                row = connection.execute(
+                    "SELECT 1 FROM monitor_policies WHERE policy_id = ?", (policy_id,)
+                ).fetchone()
+                if row is None:
+                    raise ControlPlaneNotFound("monitor policy was not found")
+                raise ControlPlaneConflict("monitor policy is not archived")
+        return self.get_monitor_policy(policy_id, include_archived=True)
+
+    def purge_monitor_policy(self, policy_id: str) -> None:
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT archived_at FROM monitor_policies WHERE policy_id = ?", (policy_id,)
+            ).fetchone()
+            if row is None:
+                raise ControlPlaneNotFound("monitor policy was not found")
+            if row["archived_at"] is None:
+                raise ControlPlaneConflict("monitor policy must be archived before purge")
+            connection.execute(
+                "UPDATE control_runs SET monitor_policy_id = NULL WHERE monitor_policy_id = ?",
+                (policy_id,),
+            )
+            connection.execute("DELETE FROM monitor_policies WHERE policy_id = ?", (policy_id,))
+
+    def request_monitor_policy_run(self, policy_id: str) -> dict[str, Any]:
+        now = _now()
+        with self._session() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE monitor_policies SET next_run_at = ?, updated_at = ?,
+                    last_dispatch_failure_code = NULL
+                WHERE policy_id = ? AND archived_at IS NULL AND enabled = 1
+                  AND (lease_until IS NULL OR lease_until <= ?)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM control_runs run
+                      WHERE run.run_id = monitor_policies.last_run_id
+                        AND run.state = 'RUNNING'
+                  )
+                """,
+                (now, now, policy_id, now),
+            )
+            if cursor.rowcount != 1:
+                row = connection.execute(
+                    """
+                    SELECT policy.enabled, policy.archived_at, policy.lease_until,
+                           run.state AS last_run_state
+                    FROM monitor_policies policy
+                    LEFT JOIN control_runs run ON run.run_id = policy.last_run_id
+                    WHERE policy.policy_id = ?
+                    """,
+                    (policy_id,),
+                ).fetchone()
+                if row is None or row["archived_at"] is not None:
+                    raise ControlPlaneNotFound("monitor policy was not found")
+                if row["lease_until"] is not None and row["lease_until"] > now:
+                    raise ControlPlaneConflict("monitor policy dispatch is already in progress")
+                if row["last_run_state"] == "RUNNING":
+                    raise ControlPlaneConflict("monitor policy already has a running probe")
+                raise ControlPlaneConflict("monitor policy is disabled")
+        return self.get_monitor_policy(policy_id)
+
+    def claim_due_monitor_policies(
+        self, *, now: str, limit: int, lease_seconds: float
+    ) -> list[dict[str, Any]]:
+        bounded = min(max(int(limit), 1), 32)
+        if lease_seconds <= 0 or lease_seconds > 300:
+            raise ValueError("monitor policy lease_seconds is out of bounds")
+        now_value = _parse_utc(now)
+        lease_until = (now_value + timedelta(seconds=lease_seconds)).isoformat()
+        claims: list[dict[str, Any]] = []
+        with self._session() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM monitor_policies
+                WHERE enabled = 1 AND archived_at IS NULL
+                  AND next_run_at IS NOT NULL AND next_run_at <= ?
+                  AND (lease_until IS NULL OR lease_until <= ?)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM control_runs run
+                      WHERE run.run_id = monitor_policies.last_run_id
+                        AND run.state = 'RUNNING'
+                  )
+                ORDER BY next_run_at, policy_id LIMIT ?
+                """,
+                (now_value.isoformat(), now_value.isoformat(), bounded),
+            ).fetchall()
+            for row in rows:
+                token = str(uuid4())
+                cursor = connection.execute(
+                    """
+                    UPDATE monitor_policies SET lease_token = ?, lease_until = ?
+                    WHERE policy_id = ? AND enabled = 1 AND archived_at IS NULL
+                      AND (lease_until IS NULL OR lease_until <= ?)
+                    """,
+                    (token, lease_until, row["policy_id"], now_value.isoformat()),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                claim = self._monitor_policy(row)
+                claim["lease_token"] = token
+                claim["scheduled_for"] = row["next_run_at"]
+                claims.append(claim)
+        return claims
+
+    def complete_monitor_policy_dispatch(
+        self,
+        policy_id: str,
+        *,
+        lease_token: str,
+        scheduled_for: str,
+        run_id: str,
+    ) -> None:
+        self._finish_monitor_policy_dispatch(
+            policy_id,
+            lease_token=lease_token,
+            scheduled_for=scheduled_for,
+            run_id=run_id,
+            failure_code=None,
+        )
+
+    def fail_monitor_policy_dispatch(
+        self,
+        policy_id: str,
+        *,
+        lease_token: str,
+        scheduled_for: str,
+        failure_code: str,
+    ) -> None:
+        if not failure_code or len(failure_code) > 128 or not failure_code.replace("_", "").isalnum():
+            raise ValueError("invalid monitor dispatch failure code")
+        self._finish_monitor_policy_dispatch(
+            policy_id,
+            lease_token=lease_token,
+            scheduled_for=scheduled_for,
+            run_id=None,
+            failure_code=failure_code,
+        )
+
+    def _finish_monitor_policy_dispatch(
+        self,
+        policy_id: str,
+        *,
+        lease_token: str,
+        scheduled_for: str,
+        run_id: str | None,
+        failure_code: str | None,
+    ) -> None:
+        now = datetime.now(UTC)
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT * FROM monitor_policies WHERE policy_id = ?", (policy_id,)
+            ).fetchone()
+            if row is None:
+                raise ControlPlaneNotFound("monitor policy was not found")
+            if row["lease_token"] != lease_token or row["next_run_at"] != scheduled_for:
+                raise ControlPlaneConflict("monitor policy dispatch lease is stale")
+            if run_id is not None:
+                linked = connection.execute(
+                    "SELECT monitor_policy_id FROM control_runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if linked is None or linked["monitor_policy_id"] != policy_id:
+                    raise ControlPlaneConflict("monitor run does not match its policy")
+            next_run = _next_schedule(
+                scheduled_for,
+                interval_seconds=int(row["interval_seconds"]),
+                now=now,
+            )
+            connection.execute(
+                """
+                UPDATE monitor_policies SET next_run_at = ?, last_run_at = ?,
+                    last_run_id = COALESCE(?, last_run_id),
+                    last_dispatch_failure_code = ?, lease_token = NULL,
+                    lease_until = NULL, updated_at = ?
+                WHERE policy_id = ? AND lease_token = ?
+                """,
+                (
+                    next_run,
+                    now.isoformat(),
+                    run_id,
+                    failure_code,
+                    now.isoformat(),
+                    policy_id,
+                    lease_token,
+                ),
+            )
+
+    def record_monitor_run(self, run_id: str) -> dict[str, Any] | None:
+        now = _now()
+        with self._session() as connection:
+            run = connection.execute(
+                "SELECT * FROM control_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if run is None:
+                raise ControlPlaneNotFound("run was not found")
+            policy_id = run["monitor_policy_id"]
+            if policy_id is None:
+                return None
+            if run["state"] == "RUNNING":
+                raise ControlPlaneConflict("running monitor run cannot be projected")
+            existing = connection.execute(
+                "SELECT * FROM monitor_samples WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if existing is not None:
+                return {
+                    "sample": self._monitor_sample(existing),
+                    "state": self._monitor_state_row(
+                        connection.execute(
+                            "SELECT * FROM monitor_states WHERE policy_id = ?", (policy_id,)
+                        ).fetchone()
+                    ),
+                    "incident": None,
+                    "replayed": True,
+                }
+            policy = connection.execute(
+                "SELECT * FROM monitor_policies WHERE policy_id = ?", (policy_id,)
+            ).fetchone()
+            if policy is None:
+                return None
+            observation = _monitor_observation(run)
+            result = json.loads(run["result_json"]) if run["result_json"] else None
+            e2e_ms, ttft_ms, error_class = _monitor_metrics(result, run["failure_code"])
+            observed_at = run["finished_at"] or now
+            sample_id = str(uuid4())
+            connection.execute(
+                """
+                INSERT INTO monitor_samples (
+                    sample_id, policy_id, run_id, observed_at, observation,
+                    error_class, p95_e2e_ms, p95_ttft_ms, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sample_id, policy_id, run_id, observed_at, observation.value,
+                    error_class, e2e_ms, ttft_ms, now,
+                ),
+            )
+            state_row = connection.execute(
+                "SELECT * FROM monitor_states WHERE policy_id = ?", (policy_id,)
+            ).fetchone()
+            if (
+                state_row is not None
+                and _parse_utc(observed_at) <= _parse_utc(state_row["last_observed_at"])
+            ):
+                sample = connection.execute(
+                    "SELECT * FROM monitor_samples WHERE sample_id = ?", (sample_id,)
+                ).fetchone()
+                return {
+                    "sample": self._monitor_sample(sample),
+                    "state": self._monitor_state_row(state_row),
+                    "incident": None,
+                    "replayed": False,
+                    "stale": True,
+                }
+            previous = (
+                MonitorState(
+                    MonitorStatus(state_row["status"]),
+                    int(state_row["consecutive_successes"]),
+                    int(state_row["consecutive_failures"]),
+                )
+                if state_row is not None
+                else None
+            )
+            transitioned = transition_state(
+                previous,
+                observation,
+                failure_threshold=int(policy["failure_threshold"]),
+                recovery_threshold=int(policy["recovery_threshold"]),
+            )
+            connection.execute(
+                """
+                INSERT INTO monitor_states (
+                    policy_id, status, consecutive_successes,
+                    consecutive_failures, last_observation, last_run_id,
+                    last_observed_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(policy_id) DO UPDATE SET
+                    status = excluded.status,
+                    consecutive_successes = excluded.consecutive_successes,
+                    consecutive_failures = excluded.consecutive_failures,
+                    last_observation = excluded.last_observation,
+                    last_run_id = excluded.last_run_id,
+                    last_observed_at = excluded.last_observed_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    policy_id, transitioned.status.value,
+                    transitioned.consecutive_successes,
+                    transitioned.consecutive_failures, observation.value,
+                    run_id, observed_at, now,
+                ),
+            )
+            incident = None
+            if transitioned.event_type is not None:
+                incident_id = str(uuid4())
+                from_status = (previous or MonitorState(MonitorStatus.UNKNOWN)).status.value
+                connection.execute(
+                    """
+                    INSERT INTO monitor_incident_events (
+                        incident_id, policy_id, run_id, event_type,
+                        from_status, to_status, error_class, observed_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        incident_id, policy_id, run_id, transitioned.event_type,
+                        from_status, transitioned.status.value, error_class,
+                        observed_at, now,
+                    ),
+                )
+                incident = {
+                    "id": incident_id,
+                    "policy_id": policy_id,
+                    "run_id": run_id,
+                    "event_type": transitioned.event_type,
+                    "from_status": from_status,
+                    "to_status": transitioned.status.value,
+                    "error_class": error_class,
+                    "observed_at": observed_at,
+                }
+            sample = connection.execute(
+                "SELECT * FROM monitor_samples WHERE sample_id = ?", (sample_id,)
+            ).fetchone()
+            state = connection.execute(
+                "SELECT * FROM monitor_states WHERE policy_id = ?", (policy_id,)
+            ).fetchone()
+        return {
+            "sample": self._monitor_sample(sample),
+            "state": self._monitor_state_row(state),
+            "incident": incident,
+            "replayed": False,
+        }
+
+    def list_monitor_incidents(
+        self, *, policy_id: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        bounded = min(max(int(limit), 1), 500)
+        where, params = ("", []) if policy_id is None else ("WHERE policy_id = ?", [policy_id])
+        with self._session() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM monitor_incident_events {where}
+                ORDER BY observed_at DESC, incident_id DESC LIMIT ?
+                """,
+                (*params, bounded),
+            ).fetchall()
+        return [self._monitor_incident(row) for row in rows]
+
+    def monitoring_overview(
+        self, *, window: str = "24h", include_archived: bool = False
+    ) -> dict[str, Any]:
+        window_seconds, bucket_seconds = _monitor_window(window)
+        now = datetime.now(UTC)
+        cutoff = (now - timedelta(seconds=window_seconds)).isoformat()
+        policy_where = "" if include_archived else "WHERE p.archived_at IS NULL"
+        with self._session() as connection:
+            policies = connection.execute(
+                f"""
+                SELECT p.*, s.status, s.consecutive_successes,
+                       s.consecutive_failures, s.last_observation,
+                       s.last_run_id AS state_last_run_id,
+                       s.last_observed_at
+                FROM monitor_policies p
+                LEFT JOIN monitor_states s ON s.policy_id = p.policy_id
+                {policy_where}
+                ORDER BY p.name COLLATE NOCASE, p.policy_id
+                """
+            ).fetchall()
+            samples = connection.execute(
+                """
+                SELECT * FROM monitor_samples
+                WHERE observed_at >= ? ORDER BY observed_at, sample_id
+                """,
+                (cutoff,),
+            ).fetchall()
+        grouped: dict[str, list[sqlite3.Row]] = {}
+        for sample in samples:
+            grouped.setdefault(sample["policy_id"], []).append(sample)
+        rows: list[dict[str, Any]] = []
+        status_counts = {status.value.lower(): 0 for status in MonitorStatus}
+        for policy in policies:
+            status_value = policy["status"] or MonitorStatus.UNKNOWN.value
+            status_counts[status_value.lower()] += 1
+            policy_samples = grouped.get(policy["policy_id"], [])
+            buckets = _aggregate_monitor_buckets(policy_samples, bucket_seconds)
+            latest = policy_samples[-1] if policy_samples else None
+            item = self._monitor_policy(policy)
+            item.update(
+                {
+                    "status": status_value,
+                    "consecutive_successes": int(policy["consecutive_successes"] or 0),
+                    "consecutive_failures": int(policy["consecutive_failures"] or 0),
+                    "last_observation": policy["last_observation"],
+                    "last_observed_at": policy["last_observed_at"],
+                    "latest_error_class": latest["error_class"] if latest else None,
+                    "sample_count": len(policy_samples),
+                    "buckets": buckets,
+                }
+            )
+            rows.append(item)
+        return {
+            "window": window,
+            "window_seconds": window_seconds,
+            "bucket_seconds": bucket_seconds,
+            "generated_at": now.isoformat(),
+            "timeline": _monitor_timeline(now, window_seconds, bucket_seconds),
+            "summary": {
+                "policies": len(policies),
+                **status_counts,
+                "samples": len(samples),
+            },
+            "policies": rows,
+        }
+
+    def prune_monitoring_data(
+        self,
+        *,
+        samples_before: str,
+        incidents_before: str,
+        limit: int = 1000,
+    ) -> dict[str, int]:
+        """Delete bounded batches of derived monitoring history.
+
+        Current health is retained in ``monitor_states``. Run records remain
+        governed by the explicit archive/purge lifecycle and are not touched.
+        """
+
+        sample_cutoff = _parse_utc(samples_before).isoformat()
+        incident_cutoff = _parse_utc(incidents_before).isoformat()
+        bounded = min(max(int(limit), 1), 10_000)
+        with self._session() as connection:
+            sample_cursor = connection.execute(
+                """
+                DELETE FROM monitor_samples WHERE sample_id IN (
+                    SELECT sample_id FROM monitor_samples
+                    WHERE observed_at < ? ORDER BY observed_at LIMIT ?
+                )
+                """,
+                (sample_cutoff, bounded),
+            )
+            incident_cursor = connection.execute(
+                """
+                DELETE FROM monitor_incident_events WHERE incident_id IN (
+                    SELECT incident_id FROM monitor_incident_events
+                    WHERE observed_at < ? ORDER BY observed_at LIMIT ?
+                )
+                """,
+                (incident_cutoff, bounded),
+            )
+        return {
+            "samples": max(sample_cursor.rowcount, 0),
+            "incidents": max(incident_cursor.rowcount, 0),
+        }
+
     # Unified run index and sanitized events
 
     def create_run(
@@ -863,16 +1523,46 @@ class ControlPlaneStore:
                     ).fetchone()
                     if revision is None or revision["archived_at"] is not None:
                         raise ControlPlaneConflict("run suite revision is missing or archived")
+                policy_id = metadata.get("monitor_policy_id")
+                if policy_id is not None:
+                    policy = connection.execute(
+                        "SELECT * FROM monitor_policies WHERE policy_id = ?",
+                        (policy_id,),
+                    ).fetchone()
+                    if policy is None or policy["archived_at"] is not None:
+                        raise ControlPlaneConflict("monitor policy is missing or archived")
+                    expected = (
+                        policy["target_id"],
+                        policy["suite_revision_id"],
+                        policy["run_kind"],
+                        policy["execution_backend"],
+                        policy["model"],
+                        policy["probe_type"],
+                        bool(policy["streaming"]),
+                        float(policy["timeout_seconds"]),
+                    )
+                    actual = (
+                        metadata.get("target_id"),
+                        metadata.get("suite_revision_id"),
+                        metadata.get("run_kind", "component"),
+                        metadata.get("execution_backend", "local"),
+                        metadata["model"],
+                        metadata["probe_type"],
+                        bool(metadata["stream"]),
+                        float(metadata["timeout_seconds"]),
+                    )
+                    if expected != actual:
+                        raise ControlPlaneConflict("monitor run does not match its policy snapshot")
                 connection.execute(
                 """
                 INSERT INTO control_runs (
                     run_id, idempotency_key, request_sha256,
-                    target_id, suite_revision_id, run_kind,
+                    target_id, suite_revision_id, monitor_policy_id, run_kind,
                     execution_backend, state, result_status, created_at,
                     finished_at, base_url, model, target_kind, provider_id,
                     run_mode, probe_type, streaming, timeout_seconds,
                     result_json, failure_code, workflow_json, archived_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'RUNNING', NULL, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING', NULL, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL)
                 """,
                 (
                     run_id,
@@ -880,6 +1570,7 @@ class ControlPlaneStore:
                     request_sha256,
                     metadata.get("target_id"),
                     metadata.get("suite_revision_id"),
+                    metadata.get("monitor_policy_id"),
                     metadata.get("run_kind", "component"),
                     metadata.get("execution_backend", "local"),
                     now,
@@ -1102,6 +1793,14 @@ class ControlPlaneStore:
                 raise ControlPlaneNotFound("run was not found")
             if row["state"] == "RUNNING" or row["archived_at"] is None:
                 raise ControlPlaneConflict("terminal run must be archived before purge")
+            if connection.execute(
+                "SELECT 1 FROM monitor_states WHERE last_run_id = ?", (run_id,)
+            ).fetchone() is not None or connection.execute(
+                "SELECT 1 FROM monitor_policies WHERE last_run_id = ?", (run_id,)
+            ).fetchone() is not None:
+                raise ControlPlaneConflict(
+                    "current monitor state run cannot be purged until a newer run is recorded"
+                )
             connection.execute("DELETE FROM control_run_events WHERE run_id = ?", (run_id,))
             connection.execute("DELETE FROM control_runs WHERE run_id = ?", (run_id,))
 
@@ -1162,6 +1861,10 @@ class ControlPlaneStore:
                 connection.execute(
                     "ALTER TABLE control_runs ADD COLUMN cancel_requested_at TEXT"
                 )
+            if "monitor_policy_id" not in run_columns:
+                connection.execute(
+                    "ALTER TABLE control_runs ADD COLUMN monitor_policy_id TEXT"
+                )
             agent_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(agent_sessions)")
@@ -1208,7 +1911,7 @@ class ControlPlaneStore:
                 WHERE idempotency_key IS NOT NULL
                 """
             )
-            for version in (1, 2, 3, 4, 5, 6, 7):
+            for version in (1, 2, 3, 4, 5, 6, 7, 8):
                 connection.execute(
                     "INSERT OR IGNORE INTO control_schema_migrations(version, applied_at) VALUES (?, ?)",
                     (version, _now()),
@@ -1490,6 +2193,7 @@ class ControlPlaneStore:
             "run_id": row["run_id"],
             "target_id": row["target_id"],
             "suite_revision_id": row["suite_revision_id"],
+            "monitor_policy_id": row["monitor_policy_id"],
             "run_kind": row["run_kind"],
             "execution_backend": row["execution_backend"],
             "state": row["state"],
@@ -1514,6 +2218,75 @@ class ControlPlaneStore:
         if include_result:
             value["result"] = json.loads(row["result_json"]) if row["result_json"] else None
         return value
+
+    @staticmethod
+    def _monitor_policy(row: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "id": row["policy_id"],
+            "name": row["name"],
+            "target_id": row["target_id"],
+            "suite_revision_id": row["suite_revision_id"],
+            "run_kind": row["run_kind"],
+            "probe_type": row["probe_type"],
+            "execution_backend": row["execution_backend"],
+            "model": row["model"],
+            "stream": bool(row["streaming"]),
+            "timeout_seconds": float(row["timeout_seconds"]),
+            "interval_seconds": int(row["interval_seconds"]),
+            "failure_threshold": int(row["failure_threshold"]),
+            "recovery_threshold": int(row["recovery_threshold"]),
+            "schedule_offset_seconds": int(row["schedule_offset_seconds"]),
+            "enabled": bool(row["enabled"]),
+            "version": int(row["version"]),
+            "next_run_at": row["next_run_at"],
+            "last_run_at": row["last_run_at"],
+            "last_run_id": row["last_run_id"],
+            "last_dispatch_failure_code": row["last_dispatch_failure_code"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "archived_at": row["archived_at"],
+        }
+
+    @staticmethod
+    def _monitor_sample(row: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "id": row["sample_id"],
+            "policy_id": row["policy_id"],
+            "run_id": row["run_id"],
+            "observed_at": row["observed_at"],
+            "observation": row["observation"],
+            "error_class": row["error_class"],
+            "p95_e2e_ms": row["p95_e2e_ms"],
+            "p95_ttft_ms": row["p95_ttft_ms"],
+        }
+
+    @staticmethod
+    def _monitor_state_row(row: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {
+            "policy_id": row["policy_id"],
+            "status": row["status"],
+            "consecutive_successes": int(row["consecutive_successes"]),
+            "consecutive_failures": int(row["consecutive_failures"]),
+            "last_observation": row["last_observation"],
+            "last_run_id": row["last_run_id"],
+            "last_observed_at": row["last_observed_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _monitor_incident(row: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "id": row["incident_id"],
+            "policy_id": row["policy_id"],
+            "run_id": row["run_id"],
+            "event_type": row["event_type"],
+            "from_status": row["from_status"],
+            "to_status": row["to_status"],
+            "error_class": row["error_class"],
+            "observed_at": row["observed_at"],
+        }
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=5, isolation_level=None)
@@ -1661,6 +2434,191 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _optional_text(value: Any) -> str | None:
+    return None if value is None else str(value)
+
+
+def _parse_utc(value: str | datetime) -> datetime:
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        raise ValueError("monitor timestamps must include a timezone")
+    return parsed.astimezone(UTC)
+
+
+def _schedule_offset(policy_id: str, interval_seconds: int) -> int:
+    spread = min(max(int(interval_seconds), 1), 60)
+    return int(hashlib.sha256(policy_id.encode("utf-8")).hexdigest()[:8], 16) % spread
+
+
+def _next_schedule(scheduled_for: str, *, interval_seconds: int, now: datetime) -> str:
+    scheduled = _parse_utc(scheduled_for)
+    interval = timedelta(seconds=interval_seconds)
+    candidate = scheduled + interval
+    if candidate <= now:
+        missed = int((now - candidate).total_seconds() // interval_seconds) + 1
+        candidate += interval * missed
+    return candidate.isoformat()
+
+
+def _validate_monitor_policy_value(value: Mapping[str, Any]) -> None:
+    required = {
+        "name", "target_id", "run_kind", "execution_backend", "model", "stream",
+        "timeout_seconds", "interval_seconds", "failure_threshold",
+        "recovery_threshold", "enabled",
+    }
+    missing = required - set(value)
+    if missing:
+        raise ValueError(f"monitor policy is missing fields: {', '.join(sorted(missing))}")
+    if value["run_kind"] not in {"component", "suite"}:
+        raise ValueError("invalid monitor policy run_kind")
+    revision_id = value.get("suite_revision_id")
+    if (value["run_kind"] == "suite") != (revision_id is not None):
+        raise ValueError("suite monitor policy must reference exactly one suite revision")
+    if value["execution_backend"] not in {"local", "temporal"}:
+        raise ValueError("invalid monitor policy execution_backend")
+    if not isinstance(value["name"], str) or not value["name"].strip():
+        raise ValueError("monitor policy name is required")
+    if not isinstance(value["model"], str) or not value["model"].strip():
+        raise ValueError("monitor policy model is required")
+    for text in (value["name"], value["model"]):
+        if redact_text(text) != text:
+            raise ValueError("monitor policy durable fields contain a credential")
+    if not 60 <= int(value["interval_seconds"]) <= 2_592_000:
+        raise ValueError("monitor policy interval is out of bounds")
+    if not 1 <= int(value["failure_threshold"]) <= 10:
+        raise ValueError("monitor failure threshold is out of bounds")
+    if not 1 <= int(value["recovery_threshold"]) <= 10:
+        raise ValueError("monitor recovery threshold is out of bounds")
+    if not 0 < float(value["timeout_seconds"]) <= 300:
+        raise ValueError("monitor timeout is out of bounds")
+
+
+def _require_monitor_references(
+    connection: sqlite3.Connection, value: Mapping[str, Any]
+) -> None:
+    target = connection.execute(
+        "SELECT archived_at FROM control_targets WHERE target_id = ?",
+        (str(value["target_id"]),),
+    ).fetchone()
+    if target is None or target["archived_at"] is not None:
+        raise ControlPlaneConflict("monitor target is missing or archived")
+    revision_id = value.get("suite_revision_id")
+    if revision_id is None:
+        return
+    revision = connection.execute(
+        """
+        SELECT s.archived_at FROM control_suite_revisions r
+        JOIN control_suites s ON s.suite_id = r.suite_id
+        WHERE r.revision_id = ?
+        """,
+        (str(revision_id),),
+    ).fetchone()
+    if revision is None or revision["archived_at"] is not None:
+        raise ControlPlaneConflict("monitor suite revision is missing or archived")
+
+
+def _monitor_observation(run: Mapping[str, Any]) -> MonitorObservation:
+    if run["state"] == "CANCELLED":
+        return MonitorObservation.UNKNOWN
+    if run["state"] == "FAILED":
+        return MonitorObservation.FAIL
+    status = run["result_status"] or "UNKNOWN"
+    try:
+        return MonitorObservation(status)
+    except ValueError:
+        return MonitorObservation.UNKNOWN
+
+
+def _monitor_metrics(
+    result: Mapping[str, Any] | None, failure_code: str | None
+) -> tuple[float | None, float | None, str | None]:
+    if not isinstance(result, Mapping):
+        return None, None, failure_code
+    measurements = result.get("measurements")
+    if not isinstance(measurements, list):
+        return None, None, failure_code
+    e2e: list[float] = []
+    ttft: list[float] = []
+    error_class = failure_code
+    for measurement in measurements:
+        if not isinstance(measurement, Mapping):
+            continue
+        if isinstance(measurement.get("e2e_ms"), (int, float)):
+            e2e.append(float(measurement["e2e_ms"]))
+        if isinstance(measurement.get("ttft_ms"), (int, float)):
+            ttft.append(float(measurement["ttft_ms"]))
+        candidate = measurement.get("error_class")
+        if error_class is None and isinstance(candidate, str) and len(candidate) <= 128:
+            error_class = candidate
+    return _percentile(e2e), _percentile(ttft), error_class
+
+
+def _percentile(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, ((95 * len(ordered) + 99) // 100) - 1)
+    return round(ordered[index], 3)
+
+
+def _monitor_window(window: str) -> tuple[int, int]:
+    windows = {
+        "90m": (5_400, 300),
+        "24h": (86_400, 3_600),
+        "7d": (604_800, 21_600),
+        "30d": (2_592_000, 86_400),
+    }
+    try:
+        return windows[window]
+    except KeyError as exc:
+        raise ValueError("monitoring window must be one of 90m, 24h, 7d, 30d") from exc
+
+
+def _aggregate_monitor_buckets(
+    samples: list[Mapping[str, Any]], bucket_seconds: int
+) -> list[dict[str, Any]]:
+    grouped: dict[int, list[Mapping[str, Any]]] = {}
+    for sample in samples:
+        stamp = int(_parse_utc(sample["observed_at"]).timestamp())
+        grouped.setdefault(stamp - (stamp % bucket_seconds), []).append(sample)
+    buckets: list[dict[str, Any]] = []
+    for stamp, rows in sorted(grouped.items()):
+        counts = {name: 0 for name in ("pass", "warn", "fail", "unknown")}
+        e2e = []
+        ttft = []
+        for row in rows:
+            counts[str(row["observation"]).lower()] += 1
+            if row["p95_e2e_ms"] is not None:
+                e2e.append(float(row["p95_e2e_ms"]))
+            if row["p95_ttft_ms"] is not None:
+                ttft.append(float(row["p95_ttft_ms"]))
+        total = len(rows)
+        buckets.append(
+            {
+                "started_at": datetime.fromtimestamp(stamp, UTC).isoformat(),
+                "total": total,
+                **counts,
+                "pass_rate": round(counts["pass"] / total * 100, 1),
+                "p95_e2e_ms": _percentile(e2e),
+                "p95_ttft_ms": _percentile(ttft),
+            }
+        )
+    return buckets
+
+
+def _monitor_timeline(
+    now: datetime, window_seconds: int, bucket_seconds: int
+) -> list[str]:
+    end = int(now.timestamp())
+    end -= end % bucket_seconds
+    count = max(window_seconds // bucket_seconds, 1)
+    start = end - (count - 1) * bucket_seconds
+    return [
+        datetime.fromtimestamp(start + index * bucket_seconds, UTC).isoformat()
+        for index in range(count)
+    ]
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS control_schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -1750,12 +2708,47 @@ CREATE TABLE IF NOT EXISTS control_suite_revisions (
     UNIQUE (suite_id, document_sha256)
 );
 
+CREATE TABLE IF NOT EXISTS monitor_policies (
+    policy_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    target_id TEXT NOT NULL REFERENCES control_targets(target_id) ON DELETE RESTRICT,
+    suite_revision_id TEXT REFERENCES control_suite_revisions(revision_id) ON DELETE RESTRICT,
+    run_kind TEXT NOT NULL CHECK (run_kind IN ('component', 'suite')),
+    probe_type TEXT NOT NULL,
+    execution_backend TEXT NOT NULL CHECK (execution_backend IN ('local', 'temporal')),
+    model TEXT NOT NULL,
+    streaming INTEGER NOT NULL CHECK (streaming IN (0, 1)),
+    timeout_seconds REAL NOT NULL CHECK (timeout_seconds > 0),
+    interval_seconds INTEGER NOT NULL CHECK (interval_seconds BETWEEN 60 AND 2592000),
+    failure_threshold INTEGER NOT NULL CHECK (failure_threshold BETWEEN 1 AND 10),
+    recovery_threshold INTEGER NOT NULL CHECK (recovery_threshold BETWEEN 1 AND 10),
+    schedule_offset_seconds INTEGER NOT NULL CHECK (schedule_offset_seconds BETWEEN 0 AND 59),
+    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+    version INTEGER NOT NULL CHECK (version >= 1),
+    next_run_at TEXT,
+    last_run_at TEXT,
+    last_run_id TEXT,
+    last_dispatch_failure_code TEXT,
+    lease_token TEXT,
+    lease_until TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    archived_at TEXT,
+    CHECK ((lease_token IS NULL) = (lease_until IS NULL)),
+    CHECK ((run_kind = 'suite') = (suite_revision_id IS NOT NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_monitor_policies_due
+ON monitor_policies(enabled, next_run_at)
+WHERE archived_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS control_runs (
     run_id TEXT PRIMARY KEY,
     idempotency_key TEXT UNIQUE,
     request_sha256 TEXT CHECK (request_sha256 IS NULL OR length(request_sha256) = 64),
     target_id TEXT REFERENCES control_targets(target_id) ON DELETE RESTRICT,
     suite_revision_id TEXT REFERENCES control_suite_revisions(revision_id) ON DELETE RESTRICT,
+    monitor_policy_id TEXT REFERENCES monitor_policies(policy_id) ON DELETE SET NULL,
     run_kind TEXT NOT NULL CHECK (run_kind IN ('component', 'suite')),
     execution_backend TEXT NOT NULL CHECK (execution_backend IN ('local', 'temporal')),
     state TEXT NOT NULL CHECK (state IN ('RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED')),
@@ -1796,4 +2789,46 @@ CREATE TABLE IF NOT EXISTS control_run_events (
     event_json TEXT NOT NULL CHECK (json_valid(event_json)),
     PRIMARY KEY (run_id, sequence)
 );
+
+CREATE TABLE IF NOT EXISTS monitor_states (
+    policy_id TEXT PRIMARY KEY REFERENCES monitor_policies(policy_id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('UNKNOWN', 'UP', 'DEGRADED', 'DOWN')),
+    consecutive_successes INTEGER NOT NULL CHECK (consecutive_successes >= 0),
+    consecutive_failures INTEGER NOT NULL CHECK (consecutive_failures >= 0),
+    last_observation TEXT NOT NULL CHECK (last_observation IN ('PASS', 'WARN', 'FAIL', 'UNKNOWN')),
+    last_run_id TEXT NOT NULL REFERENCES control_runs(run_id) ON DELETE RESTRICT,
+    last_observed_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS monitor_samples (
+    sample_id TEXT PRIMARY KEY,
+    policy_id TEXT NOT NULL REFERENCES monitor_policies(policy_id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL UNIQUE REFERENCES control_runs(run_id) ON DELETE CASCADE,
+    observed_at TEXT NOT NULL,
+    observation TEXT NOT NULL CHECK (observation IN ('PASS', 'WARN', 'FAIL', 'UNKNOWN')),
+    error_class TEXT,
+    p95_e2e_ms REAL,
+    p95_ttft_ms REAL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_monitor_samples_policy_observed
+ON monitor_samples(policy_id, observed_at DESC);
+
+CREATE TABLE IF NOT EXISTS monitor_incident_events (
+    incident_id TEXT PRIMARY KEY,
+    policy_id TEXT NOT NULL REFERENCES monitor_policies(policy_id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES control_runs(run_id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL CHECK (event_type IN ('DOWN', 'DEGRADED', 'RECOVERED')),
+    from_status TEXT NOT NULL CHECK (from_status IN ('UNKNOWN', 'UP', 'DEGRADED', 'DOWN')),
+    to_status TEXT NOT NULL CHECK (to_status IN ('UNKNOWN', 'UP', 'DEGRADED', 'DOWN')),
+    error_class TEXT,
+    observed_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (policy_id, run_id, event_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_monitor_incidents_observed
+ON monitor_incident_events(observed_at DESC);
 """

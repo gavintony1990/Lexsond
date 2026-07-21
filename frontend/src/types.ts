@@ -11,6 +11,8 @@ export type SuitePatchInput = Omit<
   "document"
 > & { document?: SuiteDocument | null };
 export type RunCreateInput = components["schemas"]["RunCreate"];
+export type MonitorPolicyCreateInput = components["schemas"]["MonitorPolicyCreate"];
+export type MonitorPolicyPatchInput = components["schemas"]["MonitorPolicyPatch"];
 export type CatalogInput = components["schemas"]["CatalogRequest"];
 
 export type RunState = "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED";
@@ -62,6 +64,7 @@ export interface Bootstrap {
     targets: number;
     suites: number;
     agent_sessions?: number;
+    monitor_policies?: number;
   };
 }
 
@@ -228,6 +231,7 @@ export interface Run {
   run_id: string;
   target_id: string | null;
   suite_revision_id: string | null;
+  monitor_policy_id: string | null;
   run_kind: "component" | "suite";
   execution_backend: "local" | "temporal";
   state: RunState;
@@ -259,6 +263,85 @@ export interface Run {
     dimension_scores: DimensionScore[];
     measurements: Measurement[];
   } | null;
+}
+
+export type MonitorStatus = "UNKNOWN" | "UP" | "DEGRADED" | "DOWN";
+
+export interface MonitorPolicy {
+  id: string;
+  name: string;
+  target_id: string;
+  suite_revision_id: string | null;
+  run_kind: "component" | "suite";
+  probe_type: ProbeType;
+  execution_backend: "local" | "temporal";
+  model: string;
+  stream: boolean;
+  timeout_seconds: number;
+  interval_seconds: number;
+  failure_threshold: number;
+  recovery_threshold: number;
+  schedule_offset_seconds: number;
+  enabled: boolean;
+  version: number;
+  next_run_at: string | null;
+  last_run_at: string | null;
+  last_run_id: string | null;
+  last_dispatch_failure_code: string | null;
+  created_at: string;
+  updated_at: string;
+  archived_at: string | null;
+}
+
+export interface MonitorBucket {
+  started_at: string;
+  total: number;
+  pass: number;
+  warn: number;
+  fail: number;
+  unknown: number;
+  pass_rate: number;
+  p95_e2e_ms: number | null;
+  p95_ttft_ms: number | null;
+}
+
+export interface MonitorPolicyOverview extends MonitorPolicy {
+  status: MonitorStatus;
+  consecutive_successes: number;
+  consecutive_failures: number;
+  last_observation: ResultStatus;
+  last_observed_at: string | null;
+  latest_error_class: string | null;
+  sample_count: number;
+  buckets: MonitorBucket[];
+}
+
+export interface MonitoringOverview {
+  window: "90m" | "24h" | "7d" | "30d";
+  window_seconds: number;
+  bucket_seconds: number;
+  generated_at: string;
+  timeline: string[];
+  summary: {
+    policies: number;
+    unknown: number;
+    up: number;
+    degraded: number;
+    down: number;
+    samples: number;
+  };
+  policies: MonitorPolicyOverview[];
+}
+
+export interface MonitorIncident {
+  id: string;
+  policy_id: string;
+  run_id: string;
+  event_type: "DOWN" | "DEGRADED" | "RECOVERED";
+  from_status: MonitorStatus;
+  to_status: MonitorStatus;
+  error_class: string | null;
+  observed_at: string;
 }
 
 export interface RunEvent {

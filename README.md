@@ -18,6 +18,8 @@ Temporal, and PostgreSQL are pinned optional boundaries around that core:
   generation, speech synthesis, and audio transcription;
 - a bounded ProbeSuite compiler and aggregate scoring engine;
 - a React/TypeScript observability console and versioned `/api/v1` control API;
+- durable continuous-monitor policies, health transitions, incidents, and
+  90-minute/24-hour/7-day/30-day availability heatmaps;
 - a LangChain Agent workbench with bounded Tools, Skills, and repository-backed memory;
 - SQLite and PostgreSQL repositories for target, suite-revision, run, and Agent-session CRUD.
 
@@ -74,6 +76,42 @@ written to SQLite/PostgreSQL/SSE/Temporal History. Temporal targets instead keep
 a non-secret `credential_ref`; the worker resolves the value from its approved
 environment/secret-manager binding.
 
+### Continuous monitoring
+
+The **持续监控** route turns a saved target and an immutable suite revision or
+component configuration into a recurring policy. The scheduler claims due work
+with a fenced lease, caps every polling batch at four policies, deterministically
+staggers new policies, and derives a UUID idempotency key from the policy plus
+scheduled slot. A restart or dispatch retry therefore cannot silently create a
+second billable request. Missed intervals advance to the next future slot rather
+than generating a catch-up storm.
+
+Health uses explicit `UNKNOWN`, `UP`, `DEGRADED`, and `DOWN` states. Failure and
+recovery thresholds prevent one transient response from flapping the board;
+`DOWN`, `DEGRADED`, and `RECOVERED` are immutable incident events linked to the
+exact run. Chat component monitors receive a deterministic moving arithmetic
+challenge plus a 128-bit per-slot nonce; the answer is never embedded in the
+prompt, and both result and nonce must match exactly. Ordinary suites keep their
+own immutable prompts and assertions.
+
+Recurring cloud calls never store an API key. Use the Temporal backend and a
+target `credential_ref`; local recurring policies are intentionally limited to
+keyless targets. Every DNS answer is revalidated at socket-connect time and the
+connection uses only that checked address while retaining the original hostname
+for TLS SNI and certificate checks. This guard also covers Agent model calls.
+Private, link-local, metadata, multicast, NAT64-embedded protected, and mixed
+public/private resolutions are blocked; explicit numeric loopback targets remain
+available for local development.
+
+Derived samples default to 30-day retention and incidents to 365 days. Cleanup
+runs hourly in bounded, time-limited batches, with an accelerated follow-up when
+a backlog remains, without deleting run history or current health.
+Override the windows with `LEXSOND_MONITOR_SAMPLE_RETENTION_DAYS` and
+`LEXSOND_MONITOR_INCIDENT_RETENTION_DAYS` (1–3650 days, incident retention must
+not be shorter than sample retention). See
+[`docs/adr/008-continuous-monitoring.md`](docs/adr/008-continuous-monitoring.md)
+and [`docs/relay-pulse-porting-analysis.md`](docs/relay-pulse-porting-analysis.md).
+
 ### LangChain Agent, Tools, Skills, and memory
 
 The **探针智能体** route maps the reference architecture directly into the
@@ -86,7 +124,7 @@ LLM/Tool event trace so a refreshed page can restore the conversation.
 Built-in Skills cover connection/authentication diagnosis, quality-evidence
 triage, and bounded probe-plan design. Their Tools read targets, recent runs,
 sanitized evidence, run events, and suites, or return a non-executing plan.
-No Agent Tool can launch a provider request in version 0.7: a proposed run links
+No Agent Tool can launch a provider request in version 0.8: a proposed run links
 back to `/runs/new` and still requires human confirmation. The model loop is
 limited to four iterations and configures zero automatic retries.
 
@@ -315,8 +353,8 @@ local-development adapters, not the production HA storage recommendation.
 
 ## Run a PostgreSQL-backed Temporal worker
 
-Apply `0001_core.sql`, `0002_access.sql`, `0003_control_plane.sql`, then
-`0004_agent_control_plane.sql` using a migration-owner
+Apply `0001_core.sql`, `0002_access.sql`, `0003_control_plane.sql`,
+`0004_agent_control_plane.sql`, then `0005_continuous_monitoring.sql` using a migration-owner
 connection. Give the worker login membership in `lexsond_worker`; it receives
 read access plus `SECURITY DEFINER` functions, not direct journal/result writes.
 The DSN and secret values are supplied only through namespaced environment
@@ -462,6 +500,9 @@ Implemented:
 - a LangChain Agent workbench with custom OpenAI-compatible `BaseChatModel`,
   Skill-scoped read-only `StructuredTool` registry, four-iteration bound,
   SQLite/PostgreSQL checkpointer, safe execution trace, and human-gated plans.
+- durable SQLite/PostgreSQL continuous-monitor policies with lease fencing,
+  deterministic slot idempotency, bounded scheduling, anti-replay arithmetic
+  challenges, transition incidents, multi-window heatmaps, and retention cleanup.
 
 Deferred to the next slices:
 
@@ -490,6 +531,10 @@ Deferred to the next slices:
   React/FastAPI control plane and the evidence-preserving LangChain probe boundary.
 - [`docs/adr/007-langchain-agent-tools-skills.md`](docs/adr/007-langchain-agent-tools-skills.md):
   Agent model, Tool/Skill registry, checkpointer, approval and credential boundaries.
+- [`docs/adr/008-continuous-monitoring.md`](docs/adr/008-continuous-monitoring.md):
+  recurring-policy leases, idempotency, health transitions, retention, and SSRF boundaries.
+- [`docs/relay-pulse-porting-analysis.md`](docs/relay-pulse-porting-analysis.md):
+  clean-room comparison with relay-pulse and the accepted/deferred feature matrix.
 - [`schemas/canary-workflow-input.schema.json`](schemas/canary-workflow-input.schema.json)
   and [`schemas/workflow-event.schema.json`](schemas/workflow-event.schema.json):
   immutable command and audit-event contracts.

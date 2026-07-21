@@ -22,6 +22,8 @@ from .api_models import (
     AgentSessionCreate,
     AgentSessionPatch,
     CatalogRequest,
+    MonitorPolicyCreate,
+    MonitorPolicyPatch,
     ProviderDetectRequest,
     RunCreate,
     SuiteCreate,
@@ -74,6 +76,12 @@ def create_app(
             default_suite_path=suite_path,
             temporal_launcher=temporal_launcher,
             store=control_store,
+            monitor_sample_retention_days=_retention_days(
+                "LEXSOND_MONITOR_SAMPLE_RETENTION_DAYS", 30
+            ),
+            monitor_incident_retention_days=_retention_days(
+                "LEXSOND_MONITOR_INCIDENT_RETENTION_DAYS", 365
+            ),
         )
 
     @asynccontextmanager
@@ -84,7 +92,7 @@ def create_app(
 
     app = FastAPI(
         title="Lexsond API",
-        version="0.7.0",
+        version="0.8.0",
         docs_url="/api/docs",
         openapi_url="/api/openapi.json",
         redoc_url=None,
@@ -377,6 +385,73 @@ def create_app(
     def purge_suite(suite_id: str) -> None:
         service.store.purge_suite(suite_id)
 
+    @app.get("/api/v1/monitor-policies")
+    def list_monitor_policies(include_archived: bool = False) -> dict[str, Any]:
+        values = service.store.list_monitor_policies(
+            include_archived=include_archived
+        )
+        return {"data": values, "meta": {"total": len(values)}}
+
+    @app.post("/api/v1/monitor-policies", status_code=status.HTTP_201_CREATED)
+    def create_monitor_policy(payload: MonitorPolicyCreate) -> dict[str, Any]:
+        return {"data": service.create_monitor_policy(payload)}
+
+    @app.get("/api/v1/monitor-policies/{policy_id}")
+    def get_monitor_policy(
+        policy_id: str, include_archived: bool = False
+    ) -> dict[str, Any]:
+        return {
+            "data": service.store.get_monitor_policy(
+                policy_id, include_archived=include_archived
+            )
+        }
+
+    @app.patch("/api/v1/monitor-policies/{policy_id}")
+    def update_monitor_policy(
+        policy_id: str, payload: MonitorPolicyPatch
+    ) -> dict[str, Any]:
+        return {"data": service.update_monitor_policy(policy_id, payload)}
+
+    @app.delete("/api/v1/monitor-policies/{policy_id}")
+    def archive_monitor_policy(policy_id: str) -> dict[str, Any]:
+        return {"data": service.store.archive_monitor_policy(policy_id)}
+
+    @app.post("/api/v1/monitor-policies/{policy_id}/restore")
+    def restore_monitor_policy(policy_id: str) -> dict[str, Any]:
+        return {"data": service.store.restore_monitor_policy(policy_id)}
+
+    @app.delete(
+        "/api/v1/monitor-policies/{policy_id}/purge",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    def purge_monitor_policy(policy_id: str) -> None:
+        service.store.purge_monitor_policy(policy_id)
+
+    @app.post("/api/v1/monitor-policies/{policy_id}/run-now")
+    def run_monitor_policy_now(policy_id: str) -> dict[str, Any]:
+        return {"data": service.request_monitor_policy_run(policy_id)}
+
+    @app.get("/api/v1/monitoring/overview")
+    def monitoring_overview(
+        window: str = Query(default="24h", pattern=r"^(90m|24h|7d|30d)$"),
+        include_archived: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "data": service.store.monitoring_overview(
+                window=window, include_archived=include_archived
+            )
+        }
+
+    @app.get("/api/v1/monitoring/incidents")
+    def monitoring_incidents(
+        policy_id: str | None = None,
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, Any]:
+        values = service.store.list_monitor_incidents(
+            policy_id=policy_id, limit=limit
+        )
+        return {"data": values, "meta": {"total": len(values), "limit": limit}}
+
     @app.get("/api/v1/runs")
     def list_runs(
         include_archived: bool = False,
@@ -510,6 +585,8 @@ def _error(
 
 
 def _target_error_code(message: str) -> str:
+    if "blocked network" in message:
+        return "TARGET_ADDRESS_BLOCKED"
     for status_code, code in (
         ("HTTP 401", "AUTHENTICATION_FAILED"),
         ("HTTP 402", "PAYMENT_REQUIRED"),
@@ -537,6 +614,19 @@ def _default_suite_path() -> Path:
     if project_suite.is_file():
         return project_suite
     return Path(__file__).with_name("default-suite.json")
+
+
+def _retention_days(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if not 1 <= value <= 3650:
+        raise ValueError(f"{name} must be between 1 and 3650")
+    return value
 
 
 def main() -> None:

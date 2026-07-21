@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 
 const bootstrap = {
-  product: { name: "Lexsond", english_name: "Lexsond · 码海测深", version: "0.7.0" },
+  product: { name: "Lexsond", english_name: "Lexsond · 码海测深", version: "0.8.0" },
   execution_backends: [
     { id: "local", available: true, status: "READY" },
     { id: "temporal", available: false, status: "NOT_CONFIGURED", supported_probe_types: ["chat"], supports_suites: true },
@@ -13,7 +13,7 @@ const bootstrap = {
   defaults: {},
   providers: [],
   probe_components: [],
-  stats: { runs: 0, running: 0, pass_rate: null, targets: 0, suites: 0, agent_sessions: 0 },
+  stats: { runs: 0, running: 0, pass_rate: null, targets: 0, suites: 0, agent_sessions: 0, monitor_policies: 0 },
 };
 
 describe("observatory console", () => {
@@ -108,6 +108,138 @@ describe("observatory console", () => {
     expect(await screen.findByRole("heading", { name: "编排一次有界质量探测" })).toBeInTheDocument();
     expect(screen.getByRole("radio", { name: /Temporal 工作流/ })).toBeDisabled();
     expect(screen.getAllByText("OFFLINE").length).toBeGreaterThan(0);
+  });
+
+  it("renders the continuous monitoring matrix without any API key field", async () => {
+    const cloudTarget = {
+      id: "00000000-0000-4000-8000-000000000010",
+      name: "Cloud monitor target",
+      target_kind: "cloud",
+      provider_id: null,
+      base_url: "https://models.example.invalid/v1",
+      default_model: "chat-model",
+      credential_ref: null,
+      credential_ref_configured: false,
+      version: 1,
+      created_at: "2026-07-20T00:00:00Z",
+      updated_at: "2026-07-20T00:00:00Z",
+      archived_at: null,
+    };
+    const monitoring = {
+      window: "24h",
+      window_seconds: 86400,
+      bucket_seconds: 3600,
+      generated_at: "2026-07-21T00:00:00Z",
+      timeline: ["2026-07-21T00:00:00Z"],
+      summary: { policies: 0, unknown: 0, up: 0, degraded: 0, down: 0, samples: 0 },
+      policies: [],
+    };
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const data = url.includes("/bootstrap")
+        ? bootstrap
+        : url.includes("/monitoring/overview")
+          ? monitoring
+          : url.includes("/targets")
+            ? [cloudTarget]
+            : [];
+      return new Response(JSON.stringify({ data }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/monitoring"]}><App /></MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByRole("heading", { name: "中转站可用性热力图" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "新建持续探测" }));
+    expect(screen.getByText("不保存 API Key")).toBeInTheDocument();
+    expect(screen.queryByLabelText(/API Key/)).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("探测目标"), {
+      target: { value: cloudTarget.id },
+    });
+    expect(await screen.findByRole("alert")).toHaveTextContent("云端目标");
+    expect(screen.getByRole("button", { name: "创建并启用" })).toBeDisabled();
+  });
+
+  it("opens an existing monitor policy in the versioned edit drawer", async () => {
+    const target = {
+      id: "00000000-0000-4000-8000-000000000011",
+      name: "Local monitor target",
+      target_kind: "local",
+      provider_id: "ollama",
+      base_url: "http://127.0.0.1:11434/v1",
+      default_model: "qwen3:8b",
+      credential_ref: null,
+      credential_ref_configured: false,
+      version: 1,
+      created_at: "2026-07-20T00:00:00Z",
+      updated_at: "2026-07-20T00:00:00Z",
+      archived_at: null,
+    };
+    const policy = {
+      id: "00000000-0000-4000-8000-000000000012",
+      name: "Existing pulse",
+      target_id: target.id,
+      suite_revision_id: null,
+      run_kind: "component",
+      probe_type: "chat",
+      execution_backend: "local",
+      model: "qwen3:8b",
+      stream: true,
+      timeout_seconds: 30,
+      interval_seconds: 300,
+      failure_threshold: 2,
+      recovery_threshold: 1,
+      schedule_offset_seconds: 12,
+      enabled: true,
+      version: 3,
+      next_run_at: "2026-07-21T00:05:00Z",
+      last_run_at: null,
+      last_run_id: null,
+      last_dispatch_failure_code: null,
+      created_at: "2026-07-20T00:00:00Z",
+      updated_at: "2026-07-20T00:00:00Z",
+      archived_at: null,
+    };
+    const overview = {
+      window: "24h",
+      window_seconds: 86400,
+      bucket_seconds: 3600,
+      generated_at: "2026-07-21T00:00:00Z",
+      timeline: [],
+      summary: { policies: 1, unknown: 1, up: 0, degraded: 0, down: 0, samples: 0 },
+      policies: [],
+    };
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const data = url.includes("/bootstrap")
+        ? bootstrap
+        : url.includes("/monitoring/overview")
+          ? overview
+          : url.includes("/monitor-policies")
+            ? [policy]
+            : url.includes("/targets")
+              ? [target]
+              : [];
+      return new Response(JSON.stringify({ data }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/monitoring"]}><App /></MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText("Existing pulse")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "编辑" }));
+    expect(screen.getByRole("heading", { name: "编辑持续探测策略" })).toBeInTheDocument();
+    expect(screen.getByLabelText("策略名称")).toHaveValue("Existing pulse");
+    expect(screen.getByRole("button", { name: "保存修改" })).toBeEnabled();
   });
 
   it("clears a run key on failure and never stores it in mutation variables", async () => {
