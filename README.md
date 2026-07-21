@@ -3,6 +3,9 @@
 “码海”指模型、协议与 Token 汇成的计算海域；“测深”取自声呐测量——
 不只判断接口通不通，还要从响应信号中量出协议、性能与输出质量的深浅。
 
+Lexsond 面向企业级 LLM 中转服务和模型厂商 Token API，持续追踪服务状态，
+以多模态技术探针、质量证据和可用性热力图呈现中转站的真实运行质量。
+
 Current implementation of the design in
 [`docs/lexsond-blueprint.md`](docs/lexsond-blueprint.md).
 
