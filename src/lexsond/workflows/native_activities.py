@@ -8,7 +8,7 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Protocol
-from urllib.parse import unquote, urlsplit
+from urllib.parse import urlsplit
 
 from ..models import NormalizedRunResult, RunStatus
 from ..storage import (
@@ -92,57 +92,6 @@ class MappingEndpointSnapshotResolver:
             raise LookupError("endpoint snapshot was not found") from exc
 
 
-class JsonEndpointSnapshotResolver(MappingEndpointSnapshotResolver):
-    @classmethod
-    def from_file(
-        cls, path: Path, *, max_bytes: int = 1_000_000
-    ) -> JsonEndpointSnapshotResolver:
-        if not isinstance(path, Path) or not path.is_absolute():
-            raise ValueError("endpoint snapshot path must be absolute")
-        if path.is_symlink() or not path.is_file():
-            raise ValueError("endpoint snapshot path must be a regular non-symlink file")
-        if not 1 <= max_bytes <= 10_000_000 or path.stat().st_size > max_bytes:
-            raise ValueError("endpoint snapshot document exceeds max_bytes")
-        try:
-            document = json.loads(path.read_bytes())
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise ValueError("endpoint snapshot document is invalid JSON") from exc
-        if not isinstance(document, dict):
-            raise ValueError("endpoint snapshot document must be an object")
-        expected = {"apiVersion", "kind", "items"}
-        if set(document) != expected:
-            raise ValueError("endpoint snapshot document fields differ from contract")
-        if document["apiVersion"] != "probe.ai/endpoints/v1alpha1":
-            raise ValueError("unsupported endpoint snapshot apiVersion")
-        if document["kind"] != "EndpointSnapshotList":
-            raise ValueError("endpoint snapshot kind must be EndpointSnapshotList")
-        items = document["items"]
-        if not isinstance(items, list) or not items:
-            raise ValueError("endpoint snapshot items must be a non-empty array")
-        snapshots: dict[str, EndpointSnapshot] = {}
-        item_fields = {
-            "endpoint_snapshot_id",
-            "protocol",
-            "base_url",
-            "model",
-            "credential_handle",
-        }
-        for index, item in enumerate(items):
-            if not isinstance(item, dict) or set(item) != item_fields:
-                raise ValueError(
-                    f"endpoint snapshot item {index} fields differ from contract"
-                )
-            snapshot = EndpointSnapshot(**item)
-            if _ENV_SECRET_HANDLE.fullmatch(snapshot.credential_handle) is None:
-                raise ValueError(
-                    "local endpoint credential_handle must use env://LEXSOND_SECRET_*"
-                )
-            if snapshot.endpoint_snapshot_id in snapshots:
-                raise ValueError("endpoint snapshot IDs must be unique")
-            snapshots[snapshot.endpoint_snapshot_id] = snapshot
-        return cls(snapshots)
-
-
 class MappingSecretResolver:
     def __init__(self, values: Mapping[str, str]) -> None:
         self._values = dict(values)
@@ -157,27 +106,6 @@ class MappingSecretResolver:
             raise LookupError("credential was not found") from exc
         if not isinstance(value, str) or not value:
             raise LookupError("credential was empty")
-        return value
-
-
-_ENV_SECRET_HANDLE = re.compile(r"^env://(LEXSOND_SECRET_[A-Z0-9_]{1,96})$")
-
-
-class EnvironmentSecretResolver:
-    """Resolve only explicitly namespaced environment secret handles."""
-
-    def __repr__(self) -> str:
-        return f"{type(self).__name__}()"
-
-    def resolve(self, credential_handle: str) -> str:
-        if not isinstance(credential_handle, str):
-            raise LookupError("credential handle must be a string")
-        match = _ENV_SECRET_HANDLE.fullmatch(credential_handle)
-        if match is None:
-            raise LookupError("credential handle is not an allowed env URI")
-        value = os.environ.get(match.group(1))
-        if not value:
-            raise LookupError("credential was not found")
         return value
 
 
@@ -272,38 +200,6 @@ class CredentialReferenceEnvironmentSecretResolver:
 
 
 _BOUND_SECRET_ENV = re.compile(r"^LEXSOND_SECRET_[A-Z0-9_]{1,96}$")
-
-
-class FileSuiteDocumentResolver:
-    def __init__(self, allowed_root: Path, *, max_bytes: int = 1_000_000) -> None:
-        if not isinstance(allowed_root, Path) or not allowed_root.is_absolute():
-            raise ValueError("allowed_root must be an absolute pathlib.Path")
-        if not allowed_root.is_dir() or allowed_root.is_symlink():
-            raise ValueError("allowed_root must be an existing non-symlink directory")
-        if not 1 <= max_bytes <= 10_000_000:
-            raise ValueError("max_bytes must be between 1 and 10000000")
-        self._root = allowed_root.resolve()
-        self._max_bytes = max_bytes
-
-    def read(self, suite_uri: str) -> bytes:
-        parsed = urlsplit(suite_uri)
-        if (
-            parsed.scheme != "file"
-            or parsed.username
-            or parsed.password
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise LookupError("local suite resolver requires a safe file URI")
-        raw_path = Path(unquote(parsed.path))
-        if raw_path.is_symlink():
-            raise LookupError("suite path must not be a symlink")
-        path = raw_path.resolve()
-        if self._root not in path.parents or not path.is_file():
-            raise LookupError("suite path escaped the configured root")
-        if path.stat().st_size > self._max_bytes:
-            raise LookupError("suite document exceeds max_bytes")
-        return path.read_bytes()
 
 
 class NativeCanaryActivities:

@@ -205,10 +205,10 @@ class CanaryWorkflowInput:
         if not isinstance(self.suite_uri, str):
             raise ValueError("suite_uri must be a string")
         parsed = urlsplit(self.suite_uri)
-        if parsed.scheme not in {"file", "s3", "https"}:
-            raise ValueError("suite_uri must use file, s3, or https")
-        if parsed.scheme in {"s3", "https"} and not parsed.hostname:
-            raise ValueError("remote suite_uri must include a host or bucket")
+        if parsed.scheme not in {"s3", "https"}:
+            raise ValueError("suite_uri must use s3 or https")
+        if not parsed.hostname:
+            raise ValueError("suite_uri must include a host or bucket")
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("suite_uri must not contain credentials, query, or fragment")
 

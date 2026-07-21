@@ -17,8 +17,8 @@ Pin `psycopg[binary]==3.3.4` and `psycopg-pool==3.3.1`, and use the synchronous
 `ConnectionPool` for
 the synchronous Journal and native Activity delegate. The pool is opened with a
 connectivity check; every repository operation owns a short connection/transaction
-scope. The module remains an optional import so the dependency-free local probe
-and SQLite tests continue to run without PostgreSQL packages.
+scope. The dependency-free native CLI remains independent of this adapter;
+control-plane and worker processes require the pinned PostgreSQL extra.
 
 `TemporalHistoryRequest` carries the complete, secret-free
 `CanaryWorkflowInput`. Before loading history, `TemporalJournalActivities`
@@ -48,8 +48,8 @@ into cooperative cancellation plus a retryable `ACTIVITY_LEASE_LOST`. `BUSY`
 includes the remaining lease duration; local and Temporal Workflows wait and
 retry the same logical attempt without consuming the domain retry budget.
 An expired lease can be taken over. A failed attempt is replayed exactly, while
-a higher Workflow-domain attempt may acquire a new lease. SQLite implements the
-same contract so local and production failure behavior do not diverge.
+a higher Workflow-domain attempt may acquire a new lease. Pure in-memory test
+doubles cover domain transitions; PostgreSQL tests own durable lease semantics.
 
 Endpoint and suite snapshots reject update/delete. Endpoint rows hold an HTTPS
 base URL, model, and a non-secret Vault/cloud Secret Manager reference. The

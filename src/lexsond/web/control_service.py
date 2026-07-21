@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import threading
 import time
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from copy import deepcopy
 from concurrent.futures import Executor, ThreadPoolExecutor
+from functools import wraps
 from pathlib import Path
 from queue import Queue
 from typing import Any, Mapping, Protocol, Sequence
@@ -38,7 +41,11 @@ from .api_models import (
     TargetCreate,
     TargetPatch,
 )
-from .control_store import ControlPlaneConflict, ControlPlaneStore
+from .control_contracts import (
+    ControlPlaneConflict,
+    ControlPlaneNotFound,
+    _require_postgres_store_contract,
+)
 from .langchain_runtime import invoke_native_probe
 
 
@@ -66,7 +73,17 @@ class TemporalLauncher(Protocol):
 
     def cancel(self, run_id: str) -> bool: ...
 
-    def close(self) -> None: ...
+    def recover(
+        self,
+        run_id: str,
+        *,
+        on_events: Any,
+        on_terminal: Any,
+    ) -> bool: ...
+
+    def close(self) -> bool: ...
+
+    def wait_closed(self, timeout: float | None = None) -> bool: ...
 
 
 class DisabledTemporalLauncher:
@@ -82,8 +99,28 @@ class DisabledTemporalLauncher:
         del run_id
         raise TemporalUnavailable("Temporal backend is not configured")
 
-    def close(self) -> None:
-        return None
+    def recover(self, run_id: str, **_: Any) -> bool:
+        del run_id
+        return False
+
+    def close(self) -> bool:
+        return True
+
+    def wait_closed(self, timeout: float | None = None) -> bool:
+        del timeout
+        return True
+
+
+def _lifecycle_operation(method: Any) -> Any:
+    @wraps(method)
+    def guarded(self: "ControlPlaneService", *args: Any, **kwargs: Any) -> Any:
+        self._begin_operation()
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._end_operation()
+
+    return guarded
 
 
 class ControlPlaneService:
@@ -92,19 +129,17 @@ class ControlPlaneService:
     def __init__(
         self,
         *,
-        database_path: str | Path | None,
+        store: Any,
         default_suite_path: str | Path,
         executor: Executor | None = None,
         temporal_launcher: TemporalLauncher | None = None,
-        store: Any | None = None,
         agent_model_factory: Any | None = None,
         monitor_scheduler: bool = True,
         monitor_sample_retention_days: int = 30,
         monitor_incident_retention_days: int = 365,
     ) -> None:
-        if store is None and database_path is None:
-            raise ValueError("database_path is required when store is not provided")
-        self.store = store or ControlPlaneStore(database_path)
+        _require_postgres_store_contract(store)
+        self.store = store
         self.agent = AgentCoordinator(
             self.store,
             model_factory=agent_model_factory,
@@ -118,39 +153,226 @@ class ControlPlaneService:
         self.temporal = temporal_launcher or DisabledTemporalLauncher()
         self._cancel_signals: dict[str, threading.Event] = {}
         self._cancel_lock = threading.Lock()
-        self._recover_temporal_runs()
-        scheduler_available = callable(
-            getattr(self.store, "claim_due_monitor_policies", None)
+        self._lifecycle_lock = threading.Lock()
+        self._lifecycle_condition = threading.Condition(self._lifecycle_lock)
+        self._operation_depth: ContextVar[int] = ContextVar(
+            f"lexsond_operation_depth_{id(self)}", default=0
         )
-        self.monitor_scheduler = MonitorScheduler(
-            self.store,
-            self._dispatch_monitor_policy,
-            enabled=monitor_scheduler and scheduler_available,
-            sample_retention_days=monitor_sample_retention_days,
-            incident_retention_days=monitor_incident_retention_days,
-        )
+        self._inflight_operations = 0
+        self._background_futures: set[Any] = set()
+        self._closing = threading.Event()
+        self._closed = False
+        self._close_in_progress = False
+        self._shutdown_finalizer_started = False
+        self._operation_drain_timeout_seconds = 2.0
+        self._consumer_drain_timeout_seconds = 2.0
+        try:
+            self._recover_temporal_runs()
+            self.monitor_scheduler = MonitorScheduler(
+                self.store,
+                self._dispatch_monitor_policy,
+                enabled=monitor_scheduler,
+                sample_retention_days=monitor_sample_retention_days,
+                incident_retention_days=monitor_incident_retention_days,
+            )
+        except BaseException:
+            self._closing.set()
+            with suppress(Exception):
+                self.temporal.close()
+            self.executor.shutdown(wait=True, cancel_futures=True)
+            raise
 
     def close(self) -> None:
-        self.monitor_scheduler.close()
-        self.executor.shutdown(wait=True, cancel_futures=False)
-        self.temporal.close()
-        close_store = getattr(self.store, "close", None)
-        if close_store is not None:
-            close_store()
+        with self._lifecycle_condition:
+            if self._closed or self._close_in_progress:
+                return
+            if self._operation_depth.get() > 0:
+                raise RuntimeError("cannot close control plane from an active operation")
+            self._close_in_progress = True
+            self._closing.set()
+
+        if not self._wait_for_operations(self._operation_drain_timeout_seconds):
+            try:
+                self._start_shutdown_finalizer()
+            except BaseException:
+                with self._lifecycle_lock:
+                    self._close_in_progress = False
+                raise
+            raise RuntimeError(
+                "active control operations did not drain; shutdown deferred"
+            )
+
+        errors, consumers_stopped = self._stop_consumers(
+            timeout=self._consumer_drain_timeout_seconds
+        )
+        closed = False
+        if consumers_stopped:
+            try:
+                self.store.close()
+                closed = True
+            except BaseException as exc:
+                errors.append(exc)
+        else:
+            try:
+                self._start_shutdown_finalizer()
+            except BaseException as exc:
+                errors.append(exc)
+            if not errors:
+                errors.append(
+                    RuntimeError(
+                        "control consumers did not stop; PostgreSQL store close deferred"
+                    )
+                )
+
+        if closed:
+            with self._lifecycle_lock:
+                self._closed = True
+                self._close_in_progress = False
+        elif not self._shutdown_finalizer_started:
+            with self._lifecycle_lock:
+                self._close_in_progress = False
+        if errors:
+            raise errors[0]
+
+    def _begin_operation(self) -> None:
+        with self._lifecycle_condition:
+            if self._closing.is_set():
+                raise ControlPlaneConflict("control plane is closing")
+            self._inflight_operations += 1
+            self._operation_depth.set(self._operation_depth.get() + 1)
+
+    def _end_operation(self) -> None:
+        with self._lifecycle_condition:
+            depth = self._operation_depth.get()
+            if depth <= 0 or self._inflight_operations <= 0:
+                raise RuntimeError("control plane operation lifecycle is corrupted")
+            self._operation_depth.set(depth - 1)
+            self._inflight_operations -= 1
+            if self._inflight_operations == 0:
+                self._lifecycle_condition.notify_all()
+
+    @contextmanager
+    def operation(self) -> Any:
+        """Keep the PostgreSQL store alive for one complete external operation."""
+
+        self._begin_operation()
+        try:
+            yield
+        finally:
+            self._end_operation()
+
+    def _submit_background(self, function: Any, *args: Any) -> Any:
+        with self._lifecycle_lock:
+            admitted_operation = self._operation_depth.get() > 0
+            if self._closing.is_set() and not admitted_operation:
+                raise ControlPlaneConflict("control plane is closing")
+            future = self.executor.submit(function, *args)
+            self._background_futures.add(future)
+        future.add_done_callback(self._background_finished)
+        return future
+
+    def _background_finished(self, future: Any) -> None:
+        with self._lifecycle_condition:
+            self._background_futures.discard(future)
+            if not self._background_futures:
+                self._lifecycle_condition.notify_all()
+
+    def _wait_for_operations(self, timeout: float | None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._lifecycle_condition:
+            while self._inflight_operations:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._lifecycle_condition.wait(remaining)
+            return True
+
+    def _wait_for_background(self, timeout: float | None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._lifecycle_condition:
+            while self._background_futures:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._lifecycle_condition.wait(remaining)
+            return True
+
+    def _stop_consumers(
+        self, *, timeout: float | None
+    ) -> tuple[list[BaseException], bool]:
+        errors: list[BaseException] = []
+        for close in (self.monitor_scheduler.close, self.temporal.close):
+            try:
+                close()
+            except BaseException as exc:
+                errors.append(exc)
+        try:
+            self.executor.shutdown(wait=False, cancel_futures=False)
+        except BaseException as exc:
+            errors.append(exc)
+        scheduler_stopped = self._wait_component_closed(
+            self.monitor_scheduler, timeout=0
+        )
+        temporal_stopped = self._wait_component_closed(self.temporal, timeout=0)
+        background_stopped = self._wait_for_background(timeout)
+        return errors, scheduler_stopped and temporal_stopped and background_stopped
+
+    @staticmethod
+    def _wait_component_closed(component: Any, *, timeout: float | None) -> bool:
+        try:
+            return bool(component.wait_closed(timeout))
+        except BaseException:
+            return False
+
+    def _start_shutdown_finalizer(self) -> None:
+        with self._lifecycle_lock:
+            if self._shutdown_finalizer_started:
+                return
+            self._shutdown_finalizer_started = True
+        finalizer = threading.Thread(
+            target=self._finish_deferred_shutdown,
+            name="lexsond-postgres-close-finalizer",
+            daemon=True,
+        )
+        try:
+            finalizer.start()
+        except BaseException:
+            with self._lifecycle_lock:
+                self._shutdown_finalizer_started = False
+            raise
+
+    def _finish_deferred_shutdown(self) -> None:
+        closed = False
+        try:
+            self._wait_for_operations(None)
+            self._stop_consumers(timeout=0)
+            scheduler_stopped = self._wait_component_closed(
+                self.monitor_scheduler, timeout=None
+            )
+            temporal_stopped = self._wait_component_closed(
+                self.temporal, timeout=None
+            )
+            background_stopped = self._wait_for_background(None)
+            if scheduler_stopped and temporal_stopped and background_stopped:
+                self.store.close()
+                closed = True
+        finally:
+            with self._lifecycle_lock:
+                self._closed = closed
+                self._close_in_progress = False
+                self._shutdown_finalizer_started = False
 
     def _recover_temporal_runs(self) -> None:
-        recover = getattr(self.temporal, "recover", None)
-        if not self.temporal.available or not callable(recover):
+        if not self.temporal.available:
             return
-        recovery_query = getattr(self.store, "list_temporal_runs_for_recovery", None)
-        runs = recovery_query() if callable(recovery_query) else self.store.list_runs(limit=100)
+        runs = self.store.list_temporal_runs_for_recovery()
         for run in runs:
             if run["state"] != "RUNNING" or run["execution_backend"] != "temporal":
                 continue
             with self._cancel_lock:
                 self._cancel_signals.setdefault(run["run_id"], threading.Event())
             try:
-                recovered = recover(
+                recovered = self.temporal.recover(
                     run["run_id"],
                     on_events=self._record_temporal_events,
                     on_terminal=self._complete_temporal_run,
@@ -160,17 +382,13 @@ class ControlPlaneService:
             if not recovered:
                 self._mark_failed(run["run_id"], "TEMPORAL_DISPATCH_INCOMPLETE")
             elif run.get("cancel_requested_at") is not None:
-                self.executor.submit(self._retry_temporal_cancel, run["run_id"])
+                self._submit_background(self._retry_temporal_cancel, run["run_id"])
 
     def bootstrap(self) -> dict[str, Any]:
         runs = self.store.list_runs(limit=100)
         terminal = [run for run in runs if run["state"] != "RUNNING"]
         passed = [run for run in terminal if run["result_status"] == "PASS"]
-        monitor_policies = (
-            self.store.list_monitor_policies()
-            if callable(getattr(self.store, "list_monitor_policies", None))
-            else []
-        )
+        monitor_policies = self.store.list_monitor_policies()
         return {
             "product": {
                 "name": "Lexsond",
@@ -385,6 +603,7 @@ class ControlPlaneService:
 
     # Runs
 
+    @_lifecycle_operation
     def start_run(
         self,
         model: RunCreate,
@@ -505,17 +724,22 @@ class ControlPlaneService:
                 self._mark_failed(run_id, "TEMPORAL_START_ERROR")
                 raise
         else:
-            self.executor.submit(
-                self._execute_local,
-                run_id,
-                api_key,
-                metadata,
-                suite,
-                signal,
-                challenge,
-            )
+            try:
+                self._submit_background(
+                    self._execute_local,
+                    run_id,
+                    api_key,
+                    metadata,
+                    suite,
+                    signal,
+                    challenge,
+                )
+            except Exception:
+                self._mark_failed(run_id, "LOCAL_DISPATCH_ERROR")
+                raise
         return self.store.get_run(run_id)
 
+    @_lifecycle_operation
     def cancel_run(self, run_id: str) -> dict[str, Any]:
         run = self.store.get_run(run_id)
         with self._cancel_lock:
@@ -526,19 +750,19 @@ class ControlPlaneService:
             cancelled = self.store.cancel_run(run_id)
             self._project_monitor_run(run_id)
             return cancelled
-        intent = self.store.request_cancel_run(run_id)
+        self.store.request_cancel_run(run_id)
         try:
             dispatched = self.temporal.cancel(run_id)
         except Exception:
             dispatched = False
         if dispatched:
             return self._confirm_temporal_cancel(run_id)
-        self.executor.submit(self._retry_temporal_cancel, run_id)
+        self._submit_background(self._retry_temporal_cancel, run_id)
         return self.store.get_run(run_id, include_archived=True)
 
     def _retry_temporal_cancel(self, run_id: str) -> None:
         delay = 0.25
-        while True:
+        while not self._closing.is_set():
             try:
                 run = self.store.get_run(run_id, include_archived=True)
             except Exception:
@@ -551,7 +775,8 @@ class ControlPlaneService:
                     return
             except Exception:
                 pass
-            time.sleep(delay)
+            if self._closing.wait(delay):
+                return
             delay = min(delay * 2, 5.0)
 
     def _confirm_temporal_cancel(self, run_id: str) -> dict[str, Any]:
@@ -617,6 +842,7 @@ class ControlPlaneService:
                     )
                 finally:
                     recorder.close()
+            result.run_id = run_id
             if cancel_signal.is_set():
                 return
             current = self.store.get_run(run_id)
@@ -702,9 +928,12 @@ class ControlPlaneService:
         try:
             try:
                 current = self.store.get_run(run_id, include_archived=True)
-            except Exception:
+            except ControlPlaneNotFound:
                 return
             if current["state"] != "RUNNING":
+                return
+            if state == "CANCELLED":
+                self._confirm_temporal_cancel(run_id)
                 return
             if state == "SUCCEEDED" and result is not None:
                 try:
@@ -724,11 +953,8 @@ class ControlPlaneService:
                 self._cancel_signals.pop(run_id, None)
 
     def _project_monitor_run(self, run_id: str) -> None:
-        project = getattr(self.store, "record_monitor_run", None)
-        if not callable(project):
-            return
         try:
-            project(run_id)
+            self.store.record_monitor_run(run_id)
         except Exception:
             try:
                 self.store.append_run_event(

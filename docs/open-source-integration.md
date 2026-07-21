@@ -36,7 +36,8 @@ The production PostgreSQL adapter uses
 extra pins `psycopg[binary]==3.3.4` and `psycopg-pool==3.3.1` exactly. Psycopg
 owns only PostgreSQL protocol and connection pooling; SQL invariants, replay,
 leases, redaction, result schemas, and error classification remain native
-project contracts. SQLite and the dependency-free probe do not import it.
+project contracts. The dependency-free native CLI does not import it; Web and
+Temporal worker processes require it because PostgreSQL is their only durable store.
 
 The Web control plane pins
 [FastAPI](https://github.com/fastapi/fastapi) `0.139.2` (MIT),

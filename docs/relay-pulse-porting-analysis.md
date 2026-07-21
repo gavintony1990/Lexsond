@@ -12,7 +12,7 @@ commit `0dfbb8e22cb2fbb4a31476e3662a2b42841f9277` (v2.68.0)。该项目以 MIT
 | 主要目标 | 公开中转通道的高频可用性看板 | API 协议、性能、质量和多模态证据平台 |
 | 后端 | Go，长驻调度器与高并发 HTTP | Python 3.12+，FastAPI + 原生探针 + LangChain 边界 |
 | 工作流 | 进程内定时调度 | 本地执行或 Temporal 持久工作流 |
-| 存储 | SQLite/PostgreSQL 时序记录 | SQLite/PostgreSQL 控制面 + 不可变运行/证据 |
+| 存储 | SQLite/PostgreSQL 时序记录 | PostgreSQL 控制面 + 不可变运行/证据 |
 | 前端 | React 公开热力图/筛选看板 | React 运维控制台、CRUD、运行证据和热力图 |
 | 密钥 | 通道级配置模型 | 本地请求临时 Key；Temporal 仅持久化 `credential_ref` |
 

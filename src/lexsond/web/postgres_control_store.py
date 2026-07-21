@@ -12,8 +12,9 @@ from psycopg.types.json import Jsonb
 from ..storage.postgres import PostgresPool
 from ..monitoring.state import MonitorState, MonitorStatus, transition_state
 from ..storage.redaction import redact_text, redact_value
+from ..storage.runtime_contracts import validate_sanitized_result
 from ..suite import compile_suite
-from .control_store import (
+from .control_contracts import (
     ControlPlaneConflict,
     ControlPlaneNotFound,
     _contains_forbidden_agent_key,
@@ -1659,6 +1660,7 @@ class PostgresControlPlaneStore:
     def complete_run(
         self, run_id: str, result: Mapping[str, Any], workflow: Mapping[str, Any]
     ) -> None:
+        validate_sanitized_result(run_id, result)
         with self._pool.connection() as connection:
             cursor = connection.execute(
                 """

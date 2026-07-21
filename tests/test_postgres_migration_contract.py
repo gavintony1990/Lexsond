@@ -8,6 +8,26 @@ MIGRATIONS = Path(__file__).parents[1] / "migrations"
 
 
 class PostgresMigrationContractTests(unittest.TestCase):
+    def test_secret_value_guard_covers_both_suite_tables(self) -> None:
+        up = (MIGRATIONS / "0006_suite_secret_value_guard.sql").read_text(
+            encoding="utf-8"
+        )
+        down = (
+            MIGRATIONS / "0006_suite_secret_value_guard.down.sql"
+        ).read_text(encoding="utf-8")
+        self.assertIn("contains_recognizable_secret_value", up)
+        self.assertIn("text_value ~ '((sk-", up)
+        self.assertIn("text_value ~* 'authorization", up)
+        self.assertIn("SELECT key, value FROM jsonb_each(p_value)", up)
+        self.assertIn("to_jsonb(child_key)", up)
+        self.assertIn("suite_revisions_no_secret_values", up)
+        self.assertIn("probe_suite_snapshots_no_secret_values", up)
+        self.assertIn("DROP CONSTRAINT IF EXISTS suite_revisions_no_secret_values", down)
+        self.assertIn(
+            "DROP CONSTRAINT IF EXISTS probe_suite_snapshots_no_secret_values",
+            down,
+        )
+
     def test_core_migration_contains_required_durability_boundaries(self) -> None:
         sql = (MIGRATIONS / "0001_core.sql").read_text(encoding="utf-8")
         required = (

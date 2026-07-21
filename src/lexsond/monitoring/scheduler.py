@@ -56,6 +56,7 @@ class MonitorScheduler:
         self._next_maintenance_at = 0.0
         self._stop = threading.Event()
         self._wake = threading.Event()
+        self._stopped = threading.Event()
         self._thread: threading.Thread | None = None
         if enabled:
             self._thread = threading.Thread(
@@ -64,15 +65,21 @@ class MonitorScheduler:
                 daemon=True,
             )
             self._thread.start()
+        else:
+            self._stopped.set()
 
     def wake(self) -> None:
         self._wake.set()
 
-    def close(self) -> None:
+    def close(self) -> bool:
         self._stop.set()
         self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout=max(self._poll_seconds * 2, 2.0))
+        return self._stopped.is_set()
+
+    def wait_closed(self, timeout: float | None = None) -> bool:
+        return self._stopped.wait(timeout)
 
     def run_once(self, *, now: str | None = None) -> int:
         observed_at = now or datetime.now(UTC).isoformat()
@@ -108,9 +115,6 @@ class MonitorScheduler:
         return dispatched
 
     def run_maintenance_once(self, *, now: str | None = None) -> dict[str, int]:
-        prune = getattr(self._store, "prune_monitoring_data", None)
-        if not callable(prune):
-            return {"samples": 0, "incidents": 0}
         observed_at = datetime.fromisoformat(now) if now is not None else datetime.now(UTC)
         if observed_at.tzinfo is None:
             observed_at = observed_at.replace(tzinfo=UTC)
@@ -128,7 +132,7 @@ class MonitorScheduler:
         started = time.monotonic()
         self._maintenance_saturated = False
         for _ in range(self._maintenance_max_batches):
-            removed = prune(**cutoffs, limit=batch_size)
+            removed = self._store.prune_monitoring_data(**cutoffs, limit=batch_size)
             totals["samples"] += int(removed.get("samples", 0))
             totals["incidents"] += int(removed.get("incidents", 0))
             full_batch = (
@@ -144,21 +148,24 @@ class MonitorScheduler:
         return totals
 
     def _run(self) -> None:
-        while not self._stop.is_set():
-            try:
-                self.run_once()
-            except Exception:
-                pass
-            if time.monotonic() >= self._next_maintenance_at:
+        try:
+            while not self._stop.is_set():
                 try:
-                    self.run_maintenance_once()
+                    self.run_once()
                 except Exception:
                     pass
-                retry_seconds = (
-                    min(self._maintenance_interval_seconds, 60.0)
-                    if self._maintenance_saturated
-                    else self._maintenance_interval_seconds
-                )
-                self._next_maintenance_at = time.monotonic() + retry_seconds
-            self._wake.wait(self._poll_seconds)
-            self._wake.clear()
+                if time.monotonic() >= self._next_maintenance_at:
+                    try:
+                        self.run_maintenance_once()
+                    except Exception:
+                        pass
+                    retry_seconds = (
+                        min(self._maintenance_interval_seconds, 60.0)
+                        if self._maintenance_saturated
+                        else self._maintenance_interval_seconds
+                    )
+                    self._next_maintenance_at = time.monotonic() + retry_seconds
+                self._wake.wait(self._poll_seconds)
+                self._wake.clear()
+        finally:
+            self._stopped.set()

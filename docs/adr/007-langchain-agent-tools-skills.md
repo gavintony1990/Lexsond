@@ -24,8 +24,7 @@ flowchart LR
     LC --> TOOL["StructuredTool registry"]
     TOOL --> CORE["Probe control plane\ntargets, runs, events, suites"]
     COORD --> MEM["Repository checkpointer\nmessages + safe trace"]
-    CORE --> SQLITE["SQLite local"]
-    CORE --> PG["PostgreSQL production"]
+    CORE --> PG["PostgreSQL durable memory"]
 ```
 
 - `OpenAICompatibleAgentModel` is a custom LangChain `BaseChatModel`. It supports
@@ -50,8 +49,8 @@ flowchart LR
   Tool arguments are filtered by the registered Pydantic schema and redacted
   before `StructuredTool.invoke`; outputs are redacted inside the Tool function
   before they can become trace outputs.
-- SQLite and PostgreSQL implement the same Agent session, message, and event
-  operations. A session freezes non-secret target connection metadata and model
+- PostgreSQL implements the Agent session, message, and event operations. A
+  session freezes non-secret target connection metadata and model
   at creation. Messages and events are ordered per session; archive/restore and
   archive-before-purge follow the control-plane lifecycle. A bounded repository
   turn lease rejects concurrent turns for the same session, closing the gap

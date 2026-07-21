@@ -737,14 +737,14 @@ Phase 0 的测量口径、runner 归一化、故障分类、可重放编排和 P
 - 可重放 `CanaryWorkflow` 领域核心：不可变输入 hash、乐观并发事件日志、稳定幂等键、
   有界重试、取消、崩溃恢复，以及目标故障与工作流故障分离。
 - PostgreSQL workflow/result/evidence/activity 初始迁移和原子 compare-and-append 函数；
-- SQLite 可重启 Journal 适配器，用于本地崩溃恢复、并发冲突和损坏历史验证；
+- PostgreSQL Journal 适配器，用于崩溃恢复、并发冲突和损坏历史验证；
 - EvidenceManifest、本地内容寻址不可覆盖存储、保留期/脱敏策略，以及持久化前移除
   原始输出和错误正文的 redaction 边界。
 - Temporal Python SDK 1.30.0 适配：Journal/Step Activities、确定性事件 ID、持久
   retry timer、Heartbeat 取消、运行中 Query、目标失败继续处理和官方 Replayer 历史回放；
   官方本地 Temporal Server 端到端覆盖成功、重试、查询与取消审计。
-- 本地 Temporal worker 组合根与原生 Activity delegate：endpoint/suite 不可变快照、
-  `env://LEXSOND_SECRET_*` Activity 内密钥解析、preflight/完整 suite、异步心跳监督、
+- PostgreSQL Temporal worker 组合根与原生 Activity delegate：endpoint/suite 不可变快照、
+  Activity 内凭据引用解析、preflight/完整 suite、异步心跳监督、
   批次取消、结果脱敏、内容寻址证据、Activity 完成结果幂等和最终结果不可变；启动命令
   只接收无密钥参数。真实 Temporal + mock relay 已跑通完整链路。
 - psycopg 3.3.4/PostgreSQL 16 运行时适配：显式连接池、Workflow run 幂等初始化、

@@ -17,11 +17,7 @@ from tempfile import TemporaryDirectory
 from uuid import UUID, uuid4, uuid5
 
 from lexsond.mock_relay import create_server
-from lexsond.storage import (
-    FileEvidenceStore,
-    SqliteCanaryRuntimeStore,
-    SqliteWorkflowJournal,
-)
+from lexsond.storage import FileEvidenceStore
 from lexsond.workflows import (
     ActivityFailure,
     ActivityInvocation,
@@ -30,11 +26,14 @@ from lexsond.workflows import (
     ActivityOutcomeStatus,
     CanaryWorkflowInput,
     FailureKind,
+    InMemoryWorkflowJournal,
     RetryPolicy,
     WorkflowEventType,
     WorkflowStatus,
     project_workflow_state,
 )
+
+from tests.in_memory_runtime import InMemoryCanaryRuntimeStore
 
 
 TEMPORAL_AVAILABLE = importlib.util.find_spec("temporalio") is not None
@@ -52,12 +51,22 @@ if TEMPORAL_AVAILABLE:
     from lexsond.workflows.temporal_contracts import TemporalCanaryResult
     from lexsond.workflows.native_activities import (
         EndpointSnapshot,
-        FileSuiteDocumentResolver,
         MappingEndpointSnapshotResolver,
         MappingSecretResolver,
         NativeCanaryActivities,
     )
     from lexsond.workflows.temporal_workflow import TemporalCanaryWorkflow
+
+
+class _MappingSuiteDocumentResolver:
+    def __init__(self, values: dict[str, bytes]) -> None:
+        self._values = values
+
+    def read(self, suite_uri: str) -> bytes:
+        try:
+            return self._values[suite_uri]
+        except KeyError as exc:
+            raise LookupError("suite snapshot was not found") from exc
 
 
 def workflow_input() -> CanaryWorkflowInput:
@@ -147,8 +156,8 @@ class TemporalWorkflowIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 retryable=True,
             )
         ]
-        with TemporaryDirectory() as directory:
-            journal = SqliteWorkflowJournal(Path(directory) / "journal.sqlite3")
+        with TemporaryDirectory():
+            journal = InMemoryWorkflowJournal()
             result = await self._execute(
                 environment,
                 executor,
@@ -191,8 +200,8 @@ class TemporalWorkflowIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "evidence:preflight:target-down",
             )
         ]
-        with TemporaryDirectory() as directory:
-            journal = SqliteWorkflowJournal(Path(directory) / "journal.sqlite3")
+        with TemporaryDirectory():
+            journal = InMemoryWorkflowJournal()
             result = await self._execute(
                 environment,
                 executor,
@@ -214,8 +223,8 @@ class TemporalWorkflowIntegrationTests(unittest.IsolatedAsyncioTestCase):
         value = workflow_input()
         activities = ScriptedTemporalActivities()
         activities.block_activity = ActivityName.VALIDATE
-        with TemporaryDirectory() as directory:
-            journal = SqliteWorkflowJournal(Path(directory) / "journal.sqlite3")
+        with TemporaryDirectory():
+            journal = InMemoryWorkflowJournal()
             task_queue = f"probe-query-{uuid4()}"
             async with self._worker(
                 environment,
@@ -251,8 +260,8 @@ class TemporalWorkflowIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         activities = ScriptedTemporalActivities()
         activities.block_activity = ActivityName.VALIDATE
-        with TemporaryDirectory() as directory:
-            journal = SqliteWorkflowJournal(Path(directory) / "journal.sqlite3")
+        with TemporaryDirectory():
+            journal = InMemoryWorkflowJournal()
             task_queue = f"probe-cancel-{uuid4()}"
             async with self._worker(
                 environment,
@@ -290,8 +299,6 @@ class TemporalWorkflowIntegrationTests(unittest.IsolatedAsyncioTestCase):
         try:
             with TemporaryDirectory() as directory:
                 root = Path(directory)
-                suite_root = root / "suites"
-                suite_root.mkdir()
                 evidence_root = root / "evidence"
                 evidence_root.mkdir()
                 source = (
@@ -307,23 +314,21 @@ class TemporalWorkflowIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 suite_bytes = json.dumps(
                     document, sort_keys=True, separators=(",", ":")
                 ).encode("utf-8")
-                suite_path = suite_root / "canary.json"
-                suite_path.write_bytes(suite_bytes)
+                suite_uri = "https://control.lexsond.invalid/suites/temporal-test"
                 endpoint_id = "native-endpoint-v1"
                 value = CanaryWorkflowInput(
                     run_id=str(uuid4()),
                     endpoint_snapshot_id=endpoint_id,
                     suite_name="openai-compatible-canary",
                     suite_version="0.1.0",
-                    suite_uri=suite_path.as_uri(),
+                    suite_uri=suite_uri,
                     suite_sha256=hashlib.sha256(suite_bytes).hexdigest(),
                     region="temporal-local-test",
                     activity_timeout_seconds=20,
                     activity_heartbeat_seconds=0.5,
                 )
-                database = root / "probe.sqlite3"
-                journal = SqliteWorkflowJournal(database)
-                runtime_store = SqliteCanaryRuntimeStore(database)
+                journal = InMemoryWorkflowJournal()
+                runtime_store = InMemoryCanaryRuntimeStore()
                 activities = NativeCanaryActivities(
                     endpoint_resolver=MappingEndpointSnapshotResolver(
                         {
@@ -336,7 +341,9 @@ class TemporalWorkflowIntegrationTests(unittest.IsolatedAsyncioTestCase):
                             )
                         }
                     ),
-                    suite_resolver=FileSuiteDocumentResolver(suite_root),
+                    suite_resolver=_MappingSuiteDocumentResolver(
+                        {suite_uri: suite_bytes}
+                    ),
                     secret_resolver=MappingSecretResolver(
                         {"secret://mock/test": "test-key"}
                     ),
@@ -369,7 +376,7 @@ class TemporalWorkflowIntegrationTests(unittest.IsolatedAsyncioTestCase):
         environment: object,
         executor: ThreadPoolExecutor,
         value: CanaryWorkflowInput,
-        journal: SqliteWorkflowJournal,
+        journal: InMemoryWorkflowJournal,
         activities: object,
     ) -> TemporalCanaryResult:
         task_queue = f"probe-run-{uuid4()}"
@@ -399,7 +406,7 @@ class TemporalWorkflowIntegrationTests(unittest.IsolatedAsyncioTestCase):
         environment: object,
         executor: ThreadPoolExecutor,
         task_queue: str,
-        journal: SqliteWorkflowJournal,
+        journal: InMemoryWorkflowJournal,
         activities: object,
     ) -> Worker:
         journal_activities = TemporalJournalActivities(journal)

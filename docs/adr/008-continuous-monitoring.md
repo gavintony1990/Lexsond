@@ -18,9 +18,9 @@ configuration.
 2. Keyless targets may run locally. Cloud recurring work requires Temporal and
    a non-secret target `credential_ref`; failure to meet this requirement is a
    validation error, never an implicit backend fallback.
-3. The repository owns `next_run_at` and a paired lease token/deadline. SQLite
-   uses transactional compare-and-set; PostgreSQL uses `FOR UPDATE SKIP LOCKED`.
-   Completion is fenced by both lease token and scheduled slot.
+3. The PostgreSQL repository owns `next_run_at` and a paired lease
+   token/deadline, claiming work with `FOR UPDATE SKIP LOCKED`. Completion is
+   fenced by both lease token and scheduled slot.
 4. Policy UUID and scheduled slot derive a stable UUID idempotency key. A missed
    interval advances to the first future slot, preventing restart catch-up
    storms. Each scheduler pass claims at most four policies.
@@ -51,7 +51,8 @@ configuration.
 ## Consequences
 
 - Multiple control processes can safely share PostgreSQL scheduling work.
-- The default SQLite scheduler is durable but is not an HA coordination claim.
+- PostgreSQL lease fencing permits multiple control processes to coordinate
+  without an embedded-database fallback.
 - There is no hidden provider retry. Dispatch idempotency protects control-plane
   retries, while each billable execution attempt still invokes the transport once.
 - Policy mutation and run-now requests conflict with an active dispatch lease;

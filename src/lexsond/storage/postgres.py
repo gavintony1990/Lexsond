@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, suppress
 from datetime import datetime
 from typing import Any, Mapping
 from uuid import UUID, uuid4
@@ -34,7 +34,7 @@ from .runtime_contracts import (
     validate_lease_seconds,
     validate_sanitized_result,
 )
-from .sqlite_journal import WorkflowJournalCorruption, WorkflowJournalIntegrityError
+from .journal_errors import WorkflowJournalCorruption, WorkflowJournalIntegrityError
 
 
 class PostgresPool:
@@ -55,7 +55,7 @@ class PostgresPool:
             raise ValueError("pool sizes must satisfy 1 <= min_size <= max_size <= 128")
         if not 1 <= timeout_seconds <= 120:
             raise ValueError("timeout_seconds must be between 1 and 120")
-        self._pool = ConnectionPool(
+        pool = ConnectionPool(
             conninfo=conninfo,
             min_size=min_size,
             max_size=max_size,
@@ -68,7 +68,13 @@ class PostgresPool:
                 "application_name": application_name,
             },
         )
-        self._pool.open(wait=True, timeout=timeout_seconds)
+        try:
+            pool.open(wait=True, timeout=timeout_seconds)
+        except BaseException:
+            with suppress(Exception):
+                pool.close()
+            raise
+        self._pool = pool
 
     def connection(self) -> AbstractContextManager[psycopg.Connection[dict[str, Any]]]:
         return self._pool.connection()

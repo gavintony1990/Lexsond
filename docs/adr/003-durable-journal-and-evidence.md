@@ -28,10 +28,9 @@ The events and normalized results tables reject update/delete operations with
 append-only triggers. The application must still replay and validate events;
 database JSON is not treated as a trusted Python object.
 
-The built-in `SqliteWorkflowJournal` implements the same atomic sequence rule
-for local development and executable crash/restart tests. It uses WAL,
-`synchronous=FULL`, foreign keys, strict event deserialization, and a new
-connection per operation. It is not the production database recommendation.
+ADR-009 later removed the embedded journal. PostgreSQL is now the sole durable
+journal; process-local tests use an in-memory journal only for deterministic
+state-machine coverage.
 
 Evidence bytes live in S3/MinIO in production. PostgreSQL stores only immutable
 manifests: URI, SHA-256, size, media type, redaction status, encryption state,
@@ -58,9 +57,7 @@ Raw timelines, reviews, and logs require an explicit retention deadline.
 
 ## Consequences and validation
 
-The local adapter proves restart, concurrency-conflict, corruption, and evidence
-tampering behavior without external services. Phase 0.5 adds an opt-in real
-PostgreSQL 16 gate that creates an ephemeral cluster, applies the core and access
+The PostgreSQL 16 gate creates an ephemeral cluster, applies the core and access
 migrations, exercises exact and conflicting concurrent appends, runs the full
 Workflow, validates Activity lease/failure replay and immutable results, checks
 least-privilege grants, verifies core migration down, and stops the cluster.

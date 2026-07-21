@@ -72,7 +72,7 @@ development server and verifies:
 2. a bounded manual retry with a stable idempotency key;
 3. preflight target failure skips execution but continues persistence;
 4. a live query while an Activity is running;
-5. cancellation reaches a heartbeat Activity and is appended to SQLite;
+5. cancellation reaches a heartbeat Activity and is appended to PostgreSQL;
 6. completed histories replay with Temporal `Replayer` without nondeterminism;
 7. the concrete native delegate runs through Temporal against the fault-injecting
    mock relay and persists a sanitized immutable result.
@@ -89,17 +89,24 @@ Activity: it emits periodic heartbeats even while the HTTP client is blocked,
 sets a thread-safe cancellation signal, waits for bounded cleanup, and consumes
 the delegate's terminal exception before reporting cancellation.
 
-The local composition root now wires a concrete native OpenAI-compatible
-delegate, SQLite Journal/idempotency/final-result stores, content-addressed file
-evidence, immutable local endpoint/suite snapshots, and Activity-only
-`env://LEXSOND_SECRET_*` resolution. A separate start command builds the
-Workflow input from exact suite bytes and rejects duplicate Workflow IDs.
+The composition root wires a concrete native OpenAI-compatible delegate,
+PostgreSQL Journal/idempotency/final-result stores, content-addressed file
+evidence, PostgreSQL endpoint/suite snapshots, and Activity-only credential
+resolution. A separate start command accepts an immutable suite reference and
+rejects duplicate Workflow IDs.
 
-Phase 0.5 wires the PostgreSQL repositories, role boundary, immutable suite
-reference start contract, and a PostgreSQL worker composition mode. Production
+The PostgreSQL repositories enforce the role boundary and immutable suite
+reference start contract. Production
 still needs S3/MinIO object bytes, native cloud Secret Manager clients,
 encrypted restricted evidence, regional task-queue deployment, and concrete
 Promptfoo/EvalScope/AIPerf Activity delegates.
+
+The Web launcher bounds both Temporal connection and Workflow-start awaits.
+Because a start timeout can occur after Temporal accepted the request, that
+outcome remains a non-terminal `RUNNING` outbox entry. The same monitor retries
+with bounded exponential backoff and the deterministic Workflow ID, while
+process recovery provides the same attachment path after restart. Neither path
+invents a failed measurement for an uncertain transport acknowledgement.
 
 ## Observed SDK note
 

@@ -26,7 +26,7 @@
     "suite_uri": {
       "type": "string",
       "format": "uri",
-      "pattern": "^(file|s3|https)://[^?#]+$",
+      "pattern": "^(s3|https)://[^?#]+$",
       "description": "Immutable object reference; presigned URLs and embedded credentials are forbidden"
     },
     "suite_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },

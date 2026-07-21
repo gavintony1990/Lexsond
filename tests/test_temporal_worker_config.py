@@ -9,19 +9,17 @@ from lexsond.workflows.temporal_worker import (
 
 
 class TemporalWorkerConfigTests(unittest.TestCase):
-    def test_sqlite_backend_requires_all_local_sources(self) -> None:
+    def test_worker_requires_postgres_credential_bindings(self) -> None:
         parser = build_parser()
         args = parser.parse_args(["--evidence-root", "/tmp/evidence"])
 
         with self.assertRaises(SystemExit):
             _validate_storage_args(parser, args)
 
-    def test_postgres_backend_accepts_secret_free_control_plane_config(self) -> None:
+    def test_worker_accepts_secret_free_postgres_config(self) -> None:
         parser = build_parser()
         args = parser.parse_args(
             [
-                "--storage-backend",
-                "postgres",
                 "--evidence-root",
                 "/tmp/evidence",
                 "--credential-bindings",
@@ -33,26 +31,22 @@ class TemporalWorkerConfigTests(unittest.TestCase):
 
         _validate_storage_args(parser, args)
 
-        self.assertEqual(args.storage_backend, "postgres")
+        self.assertFalse(hasattr(args, "storage_backend"))
         self.assertNotIn("password", vars(args))
 
-    def test_postgres_backend_rejects_local_snapshot_mix(self) -> None:
+    def test_worker_parser_rejects_removed_sqlite_options(self) -> None:
         parser = build_parser()
-        args = parser.parse_args(
-            [
-                "--storage-backend",
-                "postgres",
-                "--endpoint-snapshots",
-                "/tmp/endpoints.json",
-                "--evidence-root",
-                "/tmp/evidence",
-                "--credential-bindings",
-                "/tmp/bindings.json",
-            ]
-        )
-
         with self.assertRaises(SystemExit):
-            _validate_storage_args(parser, args)
+            parser.parse_args(
+                [
+                    "--evidence-root",
+                    "/tmp/evidence",
+                    "--credential-bindings",
+                    "/tmp/bindings.json",
+                    "--sqlite-database",
+                    "/tmp/probe.sqlite3",
+                ]
+            )
 
 
 if __name__ == "__main__":

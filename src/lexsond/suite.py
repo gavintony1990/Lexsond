@@ -10,6 +10,7 @@ from typing import Any, Callable, Mapping, Protocol
 from .models import NormalizedRunResult
 from .probe import OpenAIChatProbe, ProbeConfig
 from .scoring import ScoringPolicy, score_run
+from .storage.redaction import contains_recognizable_credential
 
 
 class SuiteValidationError(ValueError):
@@ -76,6 +77,10 @@ def compile_suite(document: Mapping[str, Any]) -> ProbeSuite:
     if not isinstance(document, Mapping):
         raise SuiteValidationError("suite document must be an object")
     _reject_secret_fields(document)
+    if contains_recognizable_credential(document):
+        raise SuiteValidationError(
+            "recognizable credential values are forbidden in suite documents"
+        )
     _require_exact_keys(document, {"apiVersion", "kind", "metadata", "spec"}, "suite")
     if document.get("apiVersion") != "probe.ai/v1alpha1":
         raise SuiteValidationError("apiVersion must be probe.ai/v1alpha1")

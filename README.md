@@ -21,7 +21,8 @@ Temporal, and PostgreSQL are pinned optional boundaries around that core:
 - durable continuous-monitor policies, health transitions, incidents, and
   90-minute/24-hour/7-day/30-day availability heatmaps;
 - a LangChain Agent workbench with bounded Tools, Skills, and repository-backed memory;
-- SQLite and PostgreSQL repositories for target, suite-revision, run, and Agent-session CRUD.
+- PostgreSQL repositories for target, suite-revision, run, workflow, monitoring,
+  and Agent-session state.
 
 ## Open the visual console
 
@@ -30,13 +31,19 @@ Build and start the React + FastAPI console:
 ```bash
 cd Lexsond
 python3 -m venv .venv
-.venv/bin/python -m pip install -e '.[web]'
+.venv/bin/python -m pip install -e '.[production]'
+export LEXSOND_POSTGRES_DSN='postgresql://probe_control@127.0.0.1/probe'
 cd frontend
 npm install
 npm run build
 cd ..
 .venv/bin/lexsond-web
 ```
+
+Apply `migrations/0001_core.sql` through
+`migrations/0006_suite_secret_value_guard.sql` with a migration-owner connection
+before the final command. The control plane intentionally has no embedded
+database fallback.
 
 For React development, run `npm run dev` in `frontend/`; Vite proxies
 `/api/v1` to port 8090. Production builds are served by FastAPI from the same
@@ -54,14 +61,14 @@ component or suite run. It provides:
 - keyless local targets such as Ollama, vLLM, LM Studio, LocalAI, and Xinference;
 - local API-key format recognition with provider, Base URL, and suggested-model
   autofill for common cloud services;
-- local run history in `.local/web.sqlite3`.
+- durable run history and Agent memory in PostgreSQL.
 
 Targets and suites support create/read/update/archive/restore/purge. Suite edits
 create immutable revisions; a run always points to the exact revision it used.
 Runs can be cancelled and archived but their configuration and result are not
 arbitrarily patchable. Purge requires an archived resource and is rejected while
-another retained run references it. The old `lexsond-web-legacy` entrypoint is
-kept only for manual comparison; `/api/v1` has no `/api/*` compatibility layer.
+another retained run references it. `/api/v1` has no compatibility persistence
+path or embedded database fallback.
 
 `POST /api/v1/runs` accepts a UUID `Idempotency-Key` header. The React console
 always supplies one, so an HTTP transport retry resolves to the original run
@@ -72,7 +79,7 @@ events idempotently.
 
 API keys are `SecretStr` request fields used only for model discovery or one
 local run. React clears them after submission. They are not returned, logged, or
-written to SQLite/PostgreSQL/SSE/Temporal History. Temporal targets instead keep
+written to PostgreSQL/SSE/Temporal History. Temporal targets instead keep
 a non-secret `credential_ref`; the worker resolves the value from its approved
 environment/secret-manager binding.
 
@@ -289,7 +296,7 @@ copied into normalized results because it may echo prompts, reasoning, or keys.
 After an editable install, the equivalent entrypoint is:
 
 ```bash
-python3 -m pip install -e .
+python3 -m pip install -e '.[production]'
 lexsond-web
 ```
 
@@ -319,46 +326,17 @@ RUN_POSTGRES_TESTS=1 PYTHONPATH=src \
   python3 -m unittest tests.test_postgres_integration -v
 ```
 
-## Run the local Temporal worker
+## Run the PostgreSQL-backed control plane and Temporal worker
 
-The example endpoint file contains only an `env://` credential handle. The key
-itself is resolved inside the Activity and never enters Workflow input/history.
+PostgreSQL is the only structured persistent-memory backend. Apply
+`0001_core.sql` through `0006_suite_secret_value_guard.sql` with a migration-owner
+connection before starting either process. The content-addressed file evidence
+store remains an explicit artifact-byte boundary; it is not a second metadata,
+workflow, or Agent-memory database.
 
-```bash
-python3 -m pip install -e '.[temporal]'
-export LEXSOND_SECRET_LOCAL_RELAY=test-key
-mkdir -p .local/evidence
-
-lexsond-temporal-worker \
-  --endpoint-snapshots config/local-endpoints.example.json \
-  --suite-root suites \
-  --evidence-root .local/evidence \
-  --sqlite-database .local/probe.sqlite3
-```
-
-With Temporal and the configured OpenAI-compatible endpoint running, start one
-immutable canary:
-
-```bash
-lexsond-temporal-start \
-  --endpoint-snapshot-id local-relay-v1 \
-  --suite-file suites/canary/openai-compatible.json \
-  --region local-dev
-```
-
-The worker rejects inline keys, endpoint config symlinks, suite symlinks,
-digest drift, and credential handles outside the
-`env://LEXSOND_SECRET_*` namespace. SQLite and the file evidence store are
-local-development adapters, not the production HA storage recommendation.
-
-## Run a PostgreSQL-backed Temporal worker
-
-Apply `0001_core.sql`, `0002_access.sql`, `0003_control_plane.sql`,
-`0004_agent_control_plane.sql`, then `0005_continuous_monitoring.sql` using a migration-owner
-connection. Give the worker login membership in `lexsond_worker`; it receives
-read access plus `SECURITY DEFINER` functions, not direct journal/result writes.
-The DSN and secret values are supplied only through namespaced environment
-variables:
+Give the worker login membership in `lexsond_worker`; it receives read access
+plus `SECURITY DEFINER` functions, not direct journal/result writes. The DSN and
+secret values are supplied only through namespaced environment variables:
 
 ```bash
 python3 -m pip install -e '.[production]'
@@ -366,16 +344,14 @@ export LEXSOND_POSTGRES_DSN='postgresql://probe_worker@db/probe'
 export LEXSOND_SECRET_OPENAI_RELAY='injected-by-secret-manager'
 
 lexsond-temporal-worker \
-  --storage-backend postgres \
   --credential-bindings config/postgres-credential-bindings.example.json \
   --evidence-root /var/lib/lexsond/evidence \
   --task-queue lexsond-canary-cn-east-1
 ```
 
-To run the FastAPI control plane on PostgreSQL and enable Temporal launches:
+To run the FastAPI control plane and enable Temporal launches:
 
 ```bash
-export LEXSOND_CONTROL_STORE=postgres
 export LEXSOND_POSTGRES_DSN='postgresql://probe_control@db/probe'
 export LEXSOND_TEMPORAL_TARGET='temporal:7233'
 export LEXSOND_TEMPORAL_NAMESPACE='default'
@@ -384,12 +360,14 @@ export LEXSOND_REGION='cn-east-1'
 lexsond-web --host 0.0.0.0 --port 8090
 ```
 
-If Temporal/PostgreSQL configuration is absent or cannot initialize, the UI
-marks Temporal unavailable and rejects that backend explicitly; it never falls
-back to local execution.
+If PostgreSQL configuration is absent or cannot initialize, the control plane
+fails startup. If Temporal alone is absent, the UI marks that execution backend
+unavailable. Once `LEXSOND_TEMPORAL_TARGET` is set, invalid Temporal or
+PostgreSQL launcher configuration fails startup instead of silently disabling
+durable workflow recovery. No persistence backend fallback is attempted.
 
-Start an immutable PostgreSQL-backed suite by reference, without passing a
-credential or DSN on the command line:
+Start an immutable suite already snapshotted in PostgreSQL by reference, without
+passing a credential or DSN on the command line:
 
 ```bash
 lexsond-temporal-start \
@@ -404,12 +382,12 @@ lexsond-temporal-start \
 
 PostgreSQL stores suite documents as `JSONB`, so `suite_sha256` is the SHA-256
 of UTF-8 JSON serialized with sorted keys, no insignificant whitespace, and
-`ensure_ascii=False`; the future control plane owns this canonicalization.
+`ensure_ascii=False`.
 
-This composition still uses node-local, sanitized file evidence. S3/MinIO
-bytes, encrypted restricted evidence, and native Vault/cloud Secret Manager
-clients remain Phase 1 deployment work; the binding adapter is for environments
-where the secret manager injects values into the worker.
+This composition still uses node-local, sanitized file evidence. S3/MinIO,
+encrypted restricted evidence, and native Vault/cloud Secret Manager clients
+remain Phase 1 deployment work; the binding adapter is for environments where
+the secret manager injects values into the worker.
 
 ## Probe a real target from the CLI
 
@@ -476,14 +454,14 @@ Implemented:
 - a replayable CanaryWorkflow domain core with immutable input hashes, ordered
   Activities, target-vs-workflow failure separation, bounded retries, stable
   idempotency keys, cancellation, optimistic journal appends, and crash resume.
-- durable local workflow replay through SQLite plus the production PostgreSQL
+- durable workflow replay through the PostgreSQL
   workflow/result/evidence/activity schema and compare-and-append function;
 - content-addressed local evidence storage, manifests, retention/redaction
   policy, and raw-output removal before normalized results become durable.
 - a pinned Temporal Python SDK 1.30.0 adapter with durable Journal Activities,
   deterministic event IDs/timers, manual domain retry, heartbeat-driven
   cancellation, live queries, target-failure continuation, and history replay.
-- a concrete native Canary Activity delegate and local worker composition root:
+- a concrete native Canary Activity delegate and PostgreSQL worker composition root:
   snapshot/digest validation, Activity-only Secret resolution, preflight/full
   suite execution, sanitized content-addressed evidence, exact outcome
   idempotency, immutable final results, and a no-secret start command.
@@ -492,15 +470,15 @@ Implemented:
   leased Activity execution, exact failure replay, immutable result/evidence
   repositories, background lease renewal, retry-budget-neutral BUSY handling,
   recursive secret constraints, least-privilege roles, and real integration tests;
-- a PostgreSQL Temporal worker mode and secret-free production suite start contract.
-- a React/FastAPI local visual console with bounded launch validation,
-  ephemeral API keys, sanitized SQLite history, live polling, four-dimension
+- a PostgreSQL-only Temporal worker and secret-free suite-reference start contract.
+- a React/FastAPI visual console with bounded launch validation,
+  ephemeral API keys, sanitized PostgreSQL history, live polling, four-dimension
   scorecards, latency traces, token/throughput readouts, request evidence, six
   modality-specific components, and a persisted seven-stage live flow diagram.
 - a LangChain Agent workbench with custom OpenAI-compatible `BaseChatModel`,
   Skill-scoped read-only `StructuredTool` registry, four-iteration bound,
-  SQLite/PostgreSQL checkpointer, safe execution trace, and human-gated plans.
-- durable SQLite/PostgreSQL continuous-monitor policies with lease fencing,
+  PostgreSQL checkpointer, safe execution trace, and human-gated plans.
+- durable PostgreSQL continuous-monitor policies with lease fencing,
   deterministic slot idempotency, bounded scheduling, anti-replay arithmetic
   challenges, transition incidents, multi-window heatmaps, and retention cleanup.
 
@@ -522,7 +500,7 @@ Deferred to the next slices:
 - [`docs/adr/002-replayable-canary-workflow.md`](docs/adr/002-replayable-canary-workflow.md):
   deterministic workflow semantics and the Temporal adapter boundary.
 - [`docs/adr/003-durable-journal-and-evidence.md`](docs/adr/003-durable-journal-and-evidence.md):
-  PostgreSQL/SQLite journal, immutable result, evidence and redaction boundaries.
+  PostgreSQL journal, immutable result, evidence and redaction boundaries.
 - [`docs/adr/004-temporal-canary-adapter.md`](docs/adr/004-temporal-canary-adapter.md):
   pinned SDK, deterministic replay, retry ownership, query and cancellation rules.
 - [`docs/adr/005-postgresql-runtime-adapter.md`](docs/adr/005-postgresql-runtime-adapter.md):
@@ -533,6 +511,8 @@ Deferred to the next slices:
   Agent model, Tool/Skill registry, checkpointer, approval and credential boundaries.
 - [`docs/adr/008-continuous-monitoring.md`](docs/adr/008-continuous-monitoring.md):
   recurring-policy leases, idempotency, health transitions, retention, and SSRF boundaries.
+- [`docs/adr/009-postgresql-only-persistence.md`](docs/adr/009-postgresql-only-persistence.md):
+  PostgreSQL-only persistent memory and the retained evidence-artifact boundary.
 - [`docs/relay-pulse-porting-analysis.md`](docs/relay-pulse-porting-analysis.md):
   clean-room comparison with relay-pulse and the accepted/deferred feature matrix.
 - [`schemas/canary-workflow-input.schema.json`](schemas/canary-workflow-input.schema.json)
@@ -541,8 +521,6 @@ Deferred to the next slices:
 - [`migrations/0001_core.sql`](migrations/0001_core.sql): the production
   PostgreSQL 16+ schema; [`schemas/evidence-manifest.schema.json`](schemas/evidence-manifest.schema.json):
   the object-store evidence contract.
-- [`schemas/local-endpoint-snapshots.schema.json`](schemas/local-endpoint-snapshots.schema.json):
-  the no-inline-secret local worker endpoint contract.
 
 Implemented external result adapters cover Promptfoo JSON output v3, AIPerf
 summary schema 1.x, and the exact EvalScope 1.9.0 report contract. They reject

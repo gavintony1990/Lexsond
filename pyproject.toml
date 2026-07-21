@@ -18,6 +18,8 @@ web = [
   "httpx==0.28.1",
   "langchain-core==1.4.9",
   "pydantic==2.13.4",
+  "psycopg[binary]==3.3.4",
+  "psycopg-pool==3.3.1",
   "uvicorn==0.51.0",
 ]
 temporal = ["temporalio==1.30.0"]
@@ -39,7 +41,6 @@ production = [
 [project.scripts]
 lexsond = "lexsond.cli:main"
 lexsond-web = "lexsond.web.app:main"
-lexsond-web-legacy = "lexsond.web.server:main"
 lexsond-temporal-worker = "lexsond.workflows.temporal_worker:main"
 lexsond-temporal-start = "lexsond.workflows.temporal_start:main"
 
@@ -48,4 +49,3 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "lexsond.web" = ["default-suite.json", "dist/*", "dist/assets/*"]
-"lexsond.web.static" = ["*.html", "*.css", "*.js", "*.svg"]

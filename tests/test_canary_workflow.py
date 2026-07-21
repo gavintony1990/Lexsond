@@ -267,6 +267,18 @@ class CanaryWorkflowTests(unittest.TestCase):
                 region="test",
             )
 
+    def test_input_rejects_removed_file_suite_uri(self) -> None:
+        with self.assertRaisesRegex(ValueError, "s3 or https"):
+            CanaryWorkflowInput(
+                run_id=str(uuid4()),
+                endpoint_snapshot_id="endpoint-v1",
+                suite_name="canary",
+                suite_version="1",
+                suite_uri="file:///tmp/canary.json",
+                suite_sha256="a" * 64,
+                region="test",
+            )
+
     def test_same_run_id_cannot_replay_with_a_different_snapshot(self) -> None:
         workflow = CanaryWorkflow(self.journal, clock=self.clock)
         workflow.run(self.input, ScriptedActivities())

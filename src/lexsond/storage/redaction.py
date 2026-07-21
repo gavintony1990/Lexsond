@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from typing import Any
 from urllib.parse import urlsplit
@@ -19,6 +19,24 @@ _RECOGNIZABLE_SECRET = re.compile(
     r"nvapi-[A-Za-z0-9_-]{8,}|csk-[A-Za-z0-9_-]{8,}|"
     r"pplx-[A-Za-z0-9_-]{8,})"
 )
+
+
+def contains_recognizable_credential(value: Any) -> bool:
+    """Return whether a JSON-compatible value contains credential-shaped text."""
+
+    if isinstance(value, str):
+        return bool(
+            _AUTHORIZATION_VALUE.search(value) or _RECOGNIZABLE_SECRET.search(value)
+        )
+    if isinstance(value, Mapping):
+        return any(
+            contains_recognizable_credential(key)
+            or contains_recognizable_credential(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(contains_recognizable_credential(item) for item in value)
+    return False
 
 
 def redact_text(value: str, *, sensitive_values: Iterable[str] = ()) -> str:

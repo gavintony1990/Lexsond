@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, AsyncIterator, Mapping
 from uuid import UUID, uuid4
@@ -36,17 +36,57 @@ from .control_service import (
     DisabledTemporalLauncher,
     TemporalUnavailable,
 )
-from .control_store import ControlPlaneConflict, ControlPlaneNotFound
+from .control_contracts import ControlPlaneConflict, ControlPlaneNotFound
 
 
 class SSEProtocolError(ValueError):
     pass
 
 
+class ControlOperationLeaseMiddleware:
+    """Hold the store lifecycle lease through the final ASGI response body."""
+
+    def __init__(self, app: Any, *, service: ControlPlaneService) -> None:
+        self._app = app
+        self._service = service
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self._app(scope, receive, send)
+            return
+        try:
+            with self._service.operation():
+                await self._app(scope, receive, send)
+        except ControlPlaneConflict as exc:
+            request_id = str(uuid4())
+            for key, value in scope.get("headers", ()):
+                if key.lower() == b"x-request-id":
+                    request_id = value.decode("utf-8", errors="replace")
+                    break
+            response = JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={
+                    "error": {
+                        "code": "CONFLICT",
+                        "message": str(exc),
+                        "details": [],
+                        "request_id": request_id,
+                    }
+                },
+                headers={
+                    "X-Request-ID": request_id,
+                    "X-Content-Type-Options": "nosniff",
+                    "Referrer-Policy": "no-referrer",
+                    "X-Frame-Options": "DENY",
+                },
+            )
+            await response(scope, receive, send)
+
+
 def create_app(
     *,
     service: ControlPlaneService | None = None,
-    database_path: str | Path = ".local/web.sqlite3",
+    postgres_dsn: str | None = None,
     suite_path: str | Path | None = None,
     frontend_path: str | Path | None = None,
 ) -> FastAPI:
@@ -54,35 +94,48 @@ def create_app(
     if suite_path is None:
         suite_path = _default_suite_path()
     if service is None:
-        control_store: Any = None
-        if os.environ.get("LEXSOND_CONTROL_STORE", "sqlite") == "postgres":
-            dsn = os.environ.get("LEXSOND_POSTGRES_DSN")
-            if not dsn:
-                raise ValueError(
-                    "LEXSOND_POSTGRES_DSN is required for the PostgreSQL control store"
-                )
+        dsn = postgres_dsn or os.environ.get("LEXSOND_POSTGRES_DSN")
+        if not dsn:
+            raise ValueError(
+                "LEXSOND_POSTGRES_DSN is required; PostgreSQL is the only "
+                "persistent control store"
+            )
+        try:
             from .postgres_control_store import PostgresControlPlaneStore
-
-            control_store = PostgresControlPlaneStore.from_dsn(dsn)
-        temporal_launcher: Any = None
+        except ModuleNotFoundError as exc:
+            if exc.name and (
+                exc.name.startswith("psycopg") or exc.name == "psycopg_pool"
+            ):
+                raise ModuleNotFoundError(
+                    "PostgreSQL support requires: pip install -e '.[production]'"
+                ) from exc
+            raise
+        control_store = PostgresControlPlaneStore.from_dsn(dsn)
+        temporal_launcher: Any = DisabledTemporalLauncher()
         try:
             from .temporal_backend import temporal_launcher_from_environment
 
-            temporal_launcher = temporal_launcher_from_environment()
-        except Exception:
-            temporal_launcher = DisabledTemporalLauncher("UNAVAILABLE")
-        service = ControlPlaneService(
-            database_path=None if control_store is not None else database_path,
-            default_suite_path=suite_path,
-            temporal_launcher=temporal_launcher,
-            store=control_store,
-            monitor_sample_retention_days=_retention_days(
-                "LEXSOND_MONITOR_SAMPLE_RETENTION_DAYS", 30
-            ),
-            monitor_incident_retention_days=_retention_days(
-                "LEXSOND_MONITOR_INCIDENT_RETENTION_DAYS", 365
-            ),
-        )
+            temporal_launcher = (
+                temporal_launcher_from_environment(postgres_dsn=dsn)
+                or temporal_launcher
+            )
+            service = ControlPlaneService(
+                default_suite_path=suite_path,
+                temporal_launcher=temporal_launcher,
+                store=control_store,
+                monitor_sample_retention_days=_retention_days(
+                    "LEXSOND_MONITOR_SAMPLE_RETENTION_DAYS", 30
+                ),
+                monitor_incident_retention_days=_retention_days(
+                    "LEXSOND_MONITOR_INCIDENT_RETENTION_DAYS", 365
+                ),
+            )
+        except BaseException:
+            with suppress(Exception):
+                temporal_launcher.close()
+            with suppress(Exception):
+                control_store.close()
+            raise
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -99,6 +152,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.service = service
+    app.add_middleware(ControlOperationLeaseMiddleware, service=service)
 
     @app.middleware("http")
     async def security_and_request_id(request: Request, call_next: Any):
@@ -633,7 +687,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the Lexsond FastAPI console")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8090)
-    parser.add_argument("--database", type=Path, default=Path(".local/web.sqlite3"))
     parser.add_argument("--suite", type=Path, default=_default_suite_path())
     parser.add_argument("--reload", action="store_true")
     args = parser.parse_args()
@@ -650,7 +703,7 @@ def main() -> None:
         )
         return
     uvicorn.run(
-        create_app(database_path=args.database, suite_path=args.suite),
+        create_app(suite_path=args.suite),
         host=args.host,
         port=args.port,
     )

@@ -60,6 +60,7 @@ class PostgresIntegrationTests(unittest.TestCase):
             cls._psql_file("0003_control_plane.sql")
             cls._psql_file("0004_agent_control_plane.sql")
             cls._psql_file("0005_continuous_monitoring.sql")
+            cls._psql_file("0006_suite_secret_value_guard.sql")
             from lexsond.storage.postgres import PostgresPool
 
             cls.pool = PostgresPool(cls.dsn, min_size=1, max_size=8)
@@ -213,10 +214,121 @@ class PostgresIntegrationTests(unittest.TestCase):
         store.archive_suite(suite["id"])
         store.purge_suite(suite["id"])
 
+    def test_fastapi_uses_postgres_store_and_rejects_secret_fields(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except ModuleNotFoundError as exc:
+            raise unittest.SkipTest("web extra is unavailable") from exc
+
+        from lexsond.web.app import create_app
+        from lexsond.web.control_service import ControlPlaneService
+        from lexsond.web.postgres_control_store import PostgresControlPlaneStore
+
+        store = PostgresControlPlaneStore(self.pool)
+        service = ControlPlaneService(
+            store=store,
+            default_suite_path=PROJECT_ROOT
+            / "suites/canary/openai-compatible.json",
+            monitor_scheduler=False,
+        )
+        self.addCleanup(service.close)
+        app = create_app(
+            service=service,
+            frontend_path=self.root / "missing-frontend",
+        )
+        secret = "sentinel-api-must-not-persist-123456"
+        suffix = uuid4().hex[:10]
+        payload = {
+            "name": f"api-{suffix}",
+            "target_kind": "local",
+            "provider_id": None,
+            "base_url": "http://127.0.0.1:8000/v1",
+            "default_model": "mock",
+            "credential_ref": None,
+        }
+
+        with TestClient(app) as client:
+            created = client.post("/api/v1/targets", json=payload)
+            malformed = client.post(
+                "/api/v1/targets", json={**payload, "api_key": secret}
+            )
+
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(malformed.status_code, 422)
+        self.assertNotIn(secret, malformed.text)
+        target = created.json()["data"]
+        self.assertNotIn(secret, json.dumps(target))
+        store.archive_target(target["id"])
+        store.purge_target(target["id"])
+
+    def test_control_store_rejects_unsanitized_result_before_write(self) -> None:
+        from lexsond.models import NormalizedRunResult, RequestMeasurement, RunStatus
+        from lexsond.storage import sanitized_result_for_persistence
+        from lexsond.web.postgres_control_store import PostgresControlPlaneStore
+
+        store = PostgresControlPlaneStore(self.pool)
+        suffix = uuid4().hex[:10]
+        target = store.create_target(
+            {
+                "name": f"result-boundary-{suffix}",
+                "target_kind": "local",
+                "provider_id": None,
+                "base_url": "http://127.0.0.1:8000/v1",
+                "default_model": "mock",
+                "credential_ref": None,
+            }
+        )
+        run_id = str(uuid4())
+        store.create_run(
+            run_id,
+            {
+                "target_id": target["id"],
+                "suite_revision_id": None,
+                "run_kind": "component",
+                "execution_backend": "local",
+                "base_url": target["base_url"],
+                "model": "mock",
+                "target_kind": "local",
+                "provider_id": None,
+                "run_mode": "single",
+                "probe_type": "chat",
+                "stream": False,
+                "timeout_seconds": 5,
+            },
+            {"schema_version": "test", "status": "RUNNING"},
+        )
+        raw = "provider-output-must-not-persist"
+        result = sanitized_result_for_persistence(
+            NormalizedRunResult(
+                run_id=run_id,
+                status=RunStatus.PASS,
+                measurements=[RequestMeasurement(output_text="safe")],
+            )
+        )
+        result["measurements"][0]["output_text"] = raw
+
+        with self.assertRaisesRegex(ValueError, "raw response text"):
+            store.complete_run(
+                run_id,
+                result,
+                {"schema_version": "test", "status": "COMPLETED"},
+            )
+
+        stored = store.get_run(run_id)
+        self.assertEqual(stored["state"], "RUNNING")
+        self.assertNotIn(raw, json.dumps(stored))
+        store.cancel_run(run_id)
+        store.archive_run(run_id)
+        store.purge_run(run_id)
+        store.archive_target(target["id"])
+        store.purge_target(target["id"])
+
     def test_postgres_monitoring_claim_projection_and_retention(self) -> None:
         from datetime import UTC, datetime, timedelta
 
-        from lexsond.web.control_store import ControlPlaneConflict
+        from lexsond.models import NormalizedRunResult, RunStatus
+        from lexsond.storage import sanitized_result_for_persistence
+        from lexsond.web.control_contracts import ControlPlaneConflict
         from lexsond.web.postgres_control_store import PostgresControlPlaneStore
 
         store = PostgresControlPlaneStore(self.pool)
@@ -290,7 +402,9 @@ class PostgresIntegrationTests(unittest.TestCase):
         )
         store.complete_run(
             run_id,
-            {"status": "PASS", "dimension_scores": [], "measurements": []},
+            sanitized_result_for_persistence(
+                NormalizedRunResult(run_id=run_id, status=RunStatus.PASS)
+            ),
             {"schema_version": "test", "status": "PASS"},
         )
         projected = store.record_monitor_run(run_id)
@@ -391,7 +505,7 @@ class PostgresIntegrationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             store.update_agent_session(
                 session["session_id"],
-                {"title": "sk-postgres-title-secret-123456"},
+                {"title": "sk-" + "p" * 32},
                 expected_version=session["version"],
             )
         future_key = "plain-postgres-future-key-456789"
@@ -720,6 +834,36 @@ class PostgresIntegrationTests(unittest.TestCase):
                         Jsonb(nested),
                     ),
                 )
+        suite_document = json.loads(
+            (PROJECT_ROOT / "suites/canary/openai-compatible.json").read_text()
+        )
+        suite_document["spec"]["request"]["prompt"] = (
+            "Never persist " + "sk-" + "x" * 32
+        )
+        suite_sha = hashlib.sha256(
+            json.dumps(
+                suite_document,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        with self.pool.connection() as connection:
+            with self.assertRaises(psycopg.errors.CheckViolation):
+                connection.execute(
+                    """
+                    INSERT INTO lexsond.probe_suite_snapshots (
+                        suite_sha256, suite_name, suite_version, suite_uri,
+                        suite_json
+                    ) VALUES (%s, %s, '1', %s, %s)
+                    """,
+                    (
+                        suite_sha,
+                        f"secret-suite-{uuid4().hex}",
+                        f"s3://probe-suites/{uuid4().hex}.json",
+                        Jsonb(suite_document),
+                    ),
+                )
         with self.pool.connection() as connection:
             with self.assertRaises(psycopg.errors.CheckViolation):
                 connection.execute(
@@ -756,6 +900,10 @@ class PostgresIntegrationTests(unittest.TestCase):
             self._psql_file("0003_control_plane.sql", database=database)
             self._psql_file("0004_agent_control_plane.sql", database=database)
             self._psql_file("0005_continuous_monitoring.sql", database=database)
+            self._psql_file("0006_suite_secret_value_guard.sql", database=database)
+            self._psql_file(
+                "0006_suite_secret_value_guard.down.sql", database=database
+            )
             self._psql_file("0005_continuous_monitoring.down.sql", database=database)
             self._psql_file("0004_agent_control_plane.down.sql", database=database)
             self._psql_file("0003_control_plane.down.sql", database=database)

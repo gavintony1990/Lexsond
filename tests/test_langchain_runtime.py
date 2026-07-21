@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import importlib.util
 import unittest
-
-from langchain_core.tracers.context import collect_runs
 
 from lexsond.models import NormalizedRunResult, RequestMeasurement, RunStatus
 from lexsond.probe import ProbeConfig, ProbeType
-from lexsond.web.langchain_runtime import NativeProbeChatModel, invoke_native_probe
 
 
+LANGCHAIN_AVAILABLE = importlib.util.find_spec("langchain_core") is not None
+if LANGCHAIN_AVAILABLE:
+    from langchain_core.tracers.context import collect_runs
+
+    from lexsond.web.langchain_runtime import NativeProbeChatModel, invoke_native_probe
+
+
+@unittest.skipUnless(LANGCHAIN_AVAILABLE, "install the web extra")
 class LangChainRuntimeTests(unittest.TestCase):
     def test_chat_model_calls_native_transport_once_and_hides_key(self) -> None:
         calls = []

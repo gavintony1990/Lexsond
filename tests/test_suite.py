@@ -35,6 +35,23 @@ class SuiteCompilationTests(unittest.TestCase):
         with self.assertRaisesRegex(SuiteValidationError, "secret material"):
             compile_suite(document)
 
+    def test_rejects_recognizable_credential_in_prompt_value(self) -> None:
+        document = suite_document()
+        document["spec"]["request"]["prompt"] = (
+            "Never persist " + "sk-" + "x" * 32
+        )
+
+        with self.assertRaisesRegex(SuiteValidationError, "credential"):
+            compile_suite(document)
+
+    def test_secret_prefix_matching_remains_case_sensitive(self) -> None:
+        document = suite_document()
+        document["spec"]["request"]["prompt"] = "A harmless SK-ABCDEFGH label"
+
+        compiled = compile_suite(document)
+
+        self.assertEqual(compiled.request.prompt, "A harmless SK-ABCDEFGH label")
+
     def test_rejects_unbounded_or_incompatible_suite(self) -> None:
         document = suite_document()
         document["spec"]["request"]["stream"] = False

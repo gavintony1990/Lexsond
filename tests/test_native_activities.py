@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import threading
 import unittest
 from pathlib import Path
@@ -10,10 +9,7 @@ from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 from lexsond.mock_relay import create_server
-from lexsond.storage import (
-    FileEvidenceStore,
-    SqliteCanaryRuntimeStore,
-)
+from lexsond.storage import FileEvidenceStore
 from lexsond.workflows import (
     ActivityName,
     CanaryWorkflow,
@@ -23,13 +19,23 @@ from lexsond.workflows import (
 )
 from lexsond.workflows.native_activities import (
     EndpointSnapshot,
-    FileSuiteDocumentResolver,
-    EnvironmentSecretResolver,
-    JsonEndpointSnapshotResolver,
     MappingEndpointSnapshotResolver,
     MappingSecretResolver,
     NativeCanaryActivities,
 )
+
+from tests.in_memory_runtime import InMemoryCanaryRuntimeStore
+
+
+class _MappingSuiteDocumentResolver:
+    def __init__(self, values: dict[str, bytes]) -> None:
+        self._values = values
+
+    def read(self, suite_uri: str) -> bytes:
+        try:
+            return self._values[suite_uri]
+        except KeyError as exc:
+            raise LookupError("suite snapshot was not found") from exc
 
 
 class NativeCanaryActivitiesTests(unittest.TestCase):
@@ -50,19 +56,16 @@ class NativeCanaryActivitiesTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        self.suite_root = self.root / "suites"
-        self.suite_root.mkdir()
         document = self._suite_document()
         document["spec"]["sampling"].update({"warmup": 0, "requests": 2})
-        self.suite_path = self.suite_root / "canary.json"
         self.suite_bytes = json.dumps(
             document, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
-        self.suite_path.write_bytes(self.suite_bytes)
+        self.suite_uri = "https://control.lexsond.invalid/suites/test-canary"
         self.suite_sha256 = hashlib.sha256(self.suite_bytes).hexdigest()
         self.evidence_root = self.root / "evidence"
         self.evidence_root.mkdir()
-        self.runtime_store = SqliteCanaryRuntimeStore(self.root / "runtime.sqlite3")
+        self.runtime_store = InMemoryCanaryRuntimeStore()
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -140,71 +143,6 @@ class NativeCanaryActivitiesTests(unittest.TestCase):
         self.assertEqual(state.status, WorkflowStatus.REJECTED)
         self.assertEqual(state.terminal_error_code, "SUITE_DIGEST_MISMATCH")
 
-    def test_local_endpoint_file_and_environment_secret_keep_values_separate(
-        self,
-    ) -> None:
-        endpoint_path = self.root / "endpoints.json"
-        endpoint_path.write_text(
-            json.dumps(
-                {
-                    "apiVersion": "probe.ai/endpoints/v1alpha1",
-                    "kind": "EndpointSnapshotList",
-                    "items": [
-                        {
-                            "endpoint_snapshot_id": "endpoint-v1",
-                            "protocol": "openai-chat",
-                            "base_url": self.base_url,
-                            "model": "mock-model",
-                            "credential_handle": "env://LEXSOND_SECRET_RELAY",
-                        }
-                    ],
-                }
-            ),
-            encoding="utf-8",
-        )
-        resolver = JsonEndpointSnapshotResolver.from_file(endpoint_path)
-        snapshot = resolver.resolve("endpoint-v1")
-        secret_resolver = EnvironmentSecretResolver()
-        previous = os.environ.get("LEXSOND_SECRET_RELAY")
-        os.environ["LEXSOND_SECRET_RELAY"] = "never-render-this-value"
-        try:
-            self.assertEqual(
-                secret_resolver.resolve(snapshot.credential_handle),
-                "never-render-this-value",
-            )
-            self.assertNotIn("never-render-this-value", repr(secret_resolver))
-            self.assertNotIn("never-render-this-value", repr(snapshot))
-        finally:
-            if previous is None:
-                os.environ.pop("LEXSOND_SECRET_RELAY", None)
-            else:
-                os.environ["LEXSOND_SECRET_RELAY"] = previous
-
-    def test_local_endpoint_file_rejects_inline_secret_field(self) -> None:
-        endpoint_path = self.root / "bad-endpoints.json"
-        endpoint_path.write_text(
-            json.dumps(
-                {
-                    "apiVersion": "probe.ai/endpoints/v1alpha1",
-                    "kind": "EndpointSnapshotList",
-                    "items": [
-                        {
-                            "endpoint_snapshot_id": "endpoint-v1",
-                            "protocol": "openai-chat",
-                            "base_url": self.base_url,
-                            "model": "mock-model",
-                            "credential_handle": "env://LEXSOND_SECRET_RELAY",
-                            "api_key": "forbidden",
-                        }
-                    ],
-                }
-            ),
-            encoding="utf-8",
-        )
-
-        with self.assertRaisesRegex(ValueError, "fields differ"):
-            JsonEndpointSnapshotResolver.from_file(endpoint_path)
-
     def _build(
         self,
         *,
@@ -218,7 +156,7 @@ class NativeCanaryActivitiesTests(unittest.TestCase):
             endpoint_snapshot_id=endpoint_id,
             suite_name="openai-compatible-canary",
             suite_version="0.1.0",
-            suite_uri=self.suite_path.as_uri(),
+            suite_uri=self.suite_uri,
             suite_sha256=self.suite_sha256,
             region="local-test",
         )
@@ -235,7 +173,9 @@ class NativeCanaryActivitiesTests(unittest.TestCase):
                     )
                 }
             ),
-            suite_resolver=FileSuiteDocumentResolver(self.suite_root),
+            suite_resolver=_MappingSuiteDocumentResolver(
+                {self.suite_uri: self.suite_bytes}
+            ),
             secret_resolver=MappingSecretResolver(secrets),
             evidence_store=FileEvidenceStore(self.evidence_root),
             runtime_store=self.runtime_store,

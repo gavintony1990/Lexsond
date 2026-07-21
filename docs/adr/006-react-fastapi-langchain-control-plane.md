@@ -17,8 +17,8 @@ extensions. Replacing it with a generic SDK would change measurement semantics.
 ## Decision
 
 - FastAPI/Pydantic v2 expose only `/api/v1`. Mutable resources live behind a
-  repository contract; SQLite is the local default and PostgreSQL is selected
-  explicitly with `LEXSOND_CONTROL_STORE=postgres`.
+  PostgreSQL repository contract. ADR-009 removes the embedded fallback, so a
+  missing or unavailable PostgreSQL DSN is a startup failure.
 - Targets are mutable metadata records and never contain an API key. Suites
   create append-only revisions. Runs retain immutable configuration/result
   snapshots and support only cancel/archive/restore/purge lifecycle commands.
@@ -36,6 +36,9 @@ extensions. Replacing it with a generic SDK would change measurement semantics.
   deduplicates projected events by the source Workflow event ID.
 - FastAPI SSE publishes sanitized sequence-numbered events with heartbeat and
   `Last-Event-ID` resumption. Invalid resume cursors fail before streaming starts.
+- A pure ASGI operation lease spans every HTTP response body, including SSE, so
+  shutdown cannot release PostgreSQL while a route or Agent lease heartbeat can
+  still use it.
 - React/TypeScript/Vite, React Router, TanStack Query, React Hook Form, and Zod
   implement the same-origin console. API keys are cleared after request
   submission and are never placed in query caches or durable browser storage.
@@ -44,7 +47,7 @@ extensions. Replacing it with a generic SDK would change measurement semantics.
 
 The control API, UI, local executor, and Temporal launcher now share one run
 index and lifecycle. Refreshing a run page reconstructs progress from persisted
-events. Production requires migrations `0001` through `0005`; the control
+events. Production requires migrations `0001` through `0006`; the control
 and worker roles remain distinct. A configured but unavailable Temporal backend
 is a visible failure rather than an implicit local fallback.
 

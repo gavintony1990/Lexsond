@@ -76,7 +76,7 @@ export function Shell({ children }: PropsWithChildren) {
           <Database size={17} />
           <div>
             <span>LOCAL EVIDENCE</span>
-            <strong>SQLite · WAL</strong>
+            <strong>PostgreSQL · DURABLE</strong>
           </div>
           <i className="live-dot" />
         </div>

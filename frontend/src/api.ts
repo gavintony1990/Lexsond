@@ -175,7 +175,6 @@ export function subscribeToRun(
     "run_failed",
     "run_cancel_requested",
     "run_cancelled",
-    "legacy_run_imported",
     "temporal_workflow_started",
     "temporal_activity_started",
     "temporal_activity_attempt_failed",
