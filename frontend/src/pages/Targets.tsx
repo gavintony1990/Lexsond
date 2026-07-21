@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Archive, Cloud, KeyRound, Laptop, Plus, Radio, RotateCcw, Search, Server, Trash2, X } from "lucide-react";
+import { Archive, Cloud, KeyRound, Laptop, Pencil, Play, Plus, Radio, RotateCcw, Search, Server, Trash2, X } from "lucide-react";
 import { useForm } from "react-hook-form";
+import { Link } from "react-router-dom";
 import { z } from "zod";
 import { api } from "../api";
 import type { Target } from "../types";
@@ -23,6 +24,8 @@ export function Targets() {
   const [editing, setEditing] = useState<Target | null | "new">(null);
   const [catalogTarget, setCatalogTarget] = useState<Target | null>(null);
   const [catalogKey, setCatalogKey] = useState("");
+  const [providerWasAutoCleared, setProviderWasAutoCleared] = useState(false);
+  const transientCatalogCredential = useRef<{ requestId: string; apiKey: string | null } | null>(null);
   const queryClient = useQueryClient();
   const bootstrap = useQuery({ queryKey: ["bootstrap"], queryFn: api.bootstrap });
   const targets = useQuery({ queryKey: ["targets", showArchived], queryFn: () => api.targets(showArchived) });
@@ -33,6 +36,7 @@ export function Targets() {
   });
 
   useEffect(() => {
+    setProviderWasAutoCleared(false);
     if (editing === "new") {
       form.reset({ name: "", provider_id: "ollama", target_kind: "local", base_url: "http://127.0.0.1:11434/v1", default_model: "", credential_ref: "" });
     } else if (editing) {
@@ -62,24 +66,55 @@ export function Targets() {
   });
   const catalog = useMutation({
     gcTime: 0,
-    mutationFn: () => api.catalog(catalogTarget!.id, catalogKey || null),
-    onSettled: () => setCatalogKey(""),
+    networkMode: "always",
+    mutationFn: ({ targetId, requestId }: { targetId: string; requestId: string }) => {
+      const credential = transientCatalogCredential.current;
+      transientCatalogCredential.current = null;
+      if (!credential || credential.requestId !== requestId) throw new Error("missing transient catalog credential");
+      return api.catalog(targetId, credential.apiKey);
+    },
+    onSettled: (_data, _error, variables) => {
+      if (transientCatalogCredential.current?.requestId === variables.requestId) transientCatalogCredential.current = null;
+    },
   });
   const closeCatalog = () => {
     setCatalogKey("");
     setCatalogTarget(null);
+    if (!catalog.isPending) catalog.reset();
+  };
+  const openCatalog = (target: Target) => {
+    if (catalog.isPending) return;
+    setCatalogKey("");
+    setCatalogTarget(target);
     catalog.reset();
   };
+  const discoverCatalog = () => {
+    if (!catalogTarget) return;
+    const requestId = crypto.randomUUID();
+    transientCatalogCredential.current = { requestId, apiKey: catalogKey || null };
+    setCatalogKey("");
+    catalog.mutate({ targetId: catalogTarget.id, requestId });
+  };
+  const catalogNeedsKey = catalogTarget?.target_kind === "cloud" && !catalogKey.trim();
 
-  const selectedProvider = useMemo(() => providers.find((item) => item.id === form.watch("provider_id")), [providers, form.watch("provider_id")]);
+  const providerId = form.watch("provider_id");
+  const baseUrl = form.watch("base_url");
+  const selectedProvider = useMemo(() => providers.find((item) => item.id === providerId), [providers, providerId]);
+  useEffect(() => {
+    if (selectedProvider && normalizeEndpoint(baseUrl) !== normalizeEndpoint(selectedProvider.base_url)) {
+      form.setValue("provider_id", "", { shouldDirty: true, shouldValidate: true });
+      setProviderWasAutoCleared(true);
+    }
+  }, [baseUrl, form, selectedProvider]);
   const chooseProvider = (providerId: string) => {
-    form.setValue("provider_id", providerId);
+    setProviderWasAutoCleared(false);
     const provider = providers.find((item) => item.id === providerId);
     if (provider) {
       form.setValue("target_kind", provider.target_kind);
       form.setValue("base_url", provider.base_url);
       form.setValue("default_model", provider.default_model);
     }
+    form.setValue("provider_id", providerId);
   };
 
   return (
@@ -108,8 +143,9 @@ export function Targets() {
               </dl>
               <footer>
                 {!target.archived_at ? <>
-                  <button className="secondary-action" onClick={() => { setCatalogKey(""); setCatalogTarget(target); catalog.reset(); }}><Search size={14} />发现模型</button>
-                  <button className="ghost-action" onClick={() => setEditing(target)}>编辑</button>
+                  <Link className="target-run-link" to={`/runs/new?target=${encodeURIComponent(target.id)}`}><Play size={13} fill="currentColor" />直接探测</Link>
+                  <button className="icon-button" aria-label={catalog.isPending ? "发现中…" : "发现模型"} disabled={catalog.isPending} onClick={() => openCatalog(target)}><Search size={14} /></button>
+                  <button className="icon-button" aria-label="编辑" onClick={() => setEditing(target)}><Pencil size={14} /></button>
                   <button className="icon-button" onClick={() => lifecycle.mutate({ action: "archive", target })} aria-label="归档"><Archive size={15} /></button>
                 </> : <>
                   <button className="secondary-action" onClick={() => lifecycle.mutate({ action: "restore", target })}><RotateCcw size={14} />恢复</button>
@@ -132,6 +168,7 @@ export function Targets() {
               <label>Provider<select {...form.register("provider_id")} onChange={(event) => chooseProvider(event.target.value)}><option value="">自定义兼容端点</option>{providers.map((provider) => <option value={provider.id} key={provider.id}>{provider.name}</option>)}</select></label>
               <div className="form-row"><label>目标类型<select {...form.register("target_kind")}><option value="local">本地</option><option value="cloud">云端</option></select></label><label>默认模型<input {...form.register("default_model")} placeholder="model-id" /></label></div>
               <label>Base URL<input {...form.register("base_url")} spellCheck={false} />{form.formState.errors.base_url && <small>{form.formState.errors.base_url.message}</small>}</label>
+              <div className={`endpoint-mode-note ${selectedProvider ? "preset" : "custom"}`}><Radio size={15} /><p><b>{selectedProvider ? "标准端点" : providerWasAutoCleared ? "已切换为自定义兼容端点" : "自定义兼容端点"}</b><span>{selectedProvider ? `当前地址由 ${selectedProvider.name} 预设管理；修改地址后会自动切换为自定义模式。` : "适用于厂商工作空间、专属域名或 OpenAI 兼容代理；不会据此推断模型身份。"}</span></p></div>
               {form.watch("target_kind") === "cloud" && <label>生产凭据引用 <span className="optional">可选</span><input {...form.register("credential_ref")} placeholder="vault://ai/deepseek" /><small>只保存 Secret Manager URI，不保存明文 Key。</small></label>}
               <div className="manifest-preview"><Server size={17} /><div><b>{selectedProvider?.english_name ?? "CUSTOM"}</b><span>{form.watch("base_url") || "等待地址"}</span></div></div>
               {save.error && <ErrorNotice error={save.error} />}
@@ -146,14 +183,22 @@ export function Targets() {
           <button className="drawer-scrim" onClick={closeCatalog} aria-label="关闭" />
           <section className="modal-card catalog-modal">
             <header><div><span className="eyebrow">MODEL CATALOG</span><h2>{catalogTarget.name}</h2></div><button className="icon-button" onClick={closeCatalog}><X size={19} /></button></header>
-            <p>Key 仅用于本次 `/models` 请求，完成后立即从输入状态清除。</p>
-            {catalogTarget.target_kind === "cloud" && <label>临时 API Key<input type="password" value={catalogKey} onChange={(event) => setCatalogKey(event.target.value)} autoComplete="off" placeholder="sk-••••••••" /></label>}
-            <button className="primary-action wide" onClick={() => catalog.mutate()} disabled={catalog.isPending}>{catalog.isPending ? "正在测深…" : "连接并读取模型"}</button>
+            <p>模型发现会直接连接目标的 `/models` 接口；Key 仅用于这一次请求，完成后立即从浏览器输入状态清除。</p>
+            {catalogTarget.target_kind === "cloud" && <>
+              <label>临时 API Key<input type="password" value={catalogKey} onChange={(event) => setCatalogKey(event.target.value)} autoComplete="off" placeholder="请粘贴本次临时 API Key" aria-describedby="catalog-key-guidance" /></label>
+              <div className={`catalog-key-guidance ${catalogNeedsKey ? "waiting" : "ready"}`} id="catalog-key-guidance"><KeyRound size={14} /><p><b>{catalogNeedsKey ? "等待输入临时 Key" : "临时 Key 已就绪"}</b><span>生产凭据引用仅供 Temporal Worker 使用，不会用于当前模型发现。</span></p></div>
+            </>}
+            <button className="primary-action wide" onClick={discoverCatalog} disabled={catalog.isPending || catalogNeedsKey}>{catalog.isPending ? "正在测深…" : "连接并读取模型"}</button>
             {catalog.error && <ErrorNotice error={catalog.error} />}
             {catalog.data && <div className="catalog-results"><div className="catalog-count"><b>{catalog.data.model_count}</b><span>MODELS REPORTED</span></div>{catalog.data.models.map((model) => <div className="catalog-row" key={model.id}><code>{model.id}</code><span>{model.probe_types.join(" · ") || "capability unknown"}</span></div>)}</div>}
+            <div className="catalog-skip"><p><b>模型发现是可选步骤</b><span>专属端点没有实现 `/models` 时，可以使用目标的默认模型直接探测。</span></p><Link to={`/runs/new?target=${encodeURIComponent(catalogTarget.id)}`} onClick={closeCatalog}>跳过发现，直接发起探测</Link></div>
           </section>
         </div>
       )}
     </div>
   );
+}
+
+function normalizeEndpoint(value: string): string {
+  return value.trim().replace(/\/+$/, "");
 }

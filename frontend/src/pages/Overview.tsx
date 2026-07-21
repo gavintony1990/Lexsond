@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Activity, ArrowUpRight, CircleDot, Clock3, Radio, Server, Waves } from "lucide-react";
+import { Activity, ArrowRight, ArrowUpRight, Check, CircleDot, Clock3, Radio, Server, Waves } from "lucide-react";
 import { Link } from "react-router-dom";
 import { api } from "../api";
 import { EmptyState, ErrorNotice, formatTime, MetricCard, PageHead, StatusPill } from "../ui";
@@ -10,6 +10,8 @@ export function Overview() {
   const stats = bootstrap.data?.stats;
   const recent = runs.data?.slice(0, 6) ?? [];
   const signal = recent.slice(0, 18).reverse();
+  const hasTarget = (stats?.targets ?? 0) > 0;
+  const needsFirstRun = stats !== undefined && stats.runs === 0;
 
   return (
     <div className="page-stack">
@@ -21,6 +23,33 @@ export function Overview() {
       />
 
       {(bootstrap.error || runs.error) && <ErrorNotice error={bootstrap.error || runs.error} />}
+
+      {needsFirstRun && (
+        <section className="panel first-run-panel reveal delay-1">
+          <div className="first-run-copy">
+            <span className="eyebrow">FIRST PROBE / 首次探测</span>
+            <h2>第一次探测，从这里开始</h2>
+            <p>不用先配置套件、智能体或持续监控。按顺序完成下面三步，大约两分钟就能得到第一份可追溯结果。</p>
+            <Link to={hasTarget ? "/runs/new" : "/targets"} className="primary-action">
+              {hasTarget ? "发起第一次探测" : "添加第一个目标"}<ArrowRight size={16} />
+            </Link>
+          </div>
+          <div className="first-run-steps">
+            <article className={hasTarget ? "done" : "active"}>
+              <span>{hasTarget ? <Check size={16} /> : "01"}</span>
+              <div><b>添加 API 目标</b><p>告诉系统请求发往哪里，并填写默认模型；这里不保存明文 Key。</p></div>
+            </article>
+            <article className={hasTarget ? "active" : "pending"}>
+              <span>02</span>
+              <div><b>运行推荐探针</b><p>第一次选“单项探针 → 文本聊天 → 本地执行器”，只产生一次模型调用。</p></div>
+            </article>
+            <article className="pending">
+              <span>03</span>
+              <div><b>读懂探测结果</b><p>先看结论，再展开时延、协议和质量证据；缺少证据会明确显示 UNKNOWN。</p></div>
+            </article>
+          </div>
+        </section>
+      )}
 
       <section className="metric-grid stagger-grid">
         <MetricCard code="01" label="累计运行" value={stats?.runs ?? "—"} suffix=" RUNS" />

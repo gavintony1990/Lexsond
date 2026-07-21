@@ -51,6 +51,33 @@ origin. Open [http://127.0.0.1:8090](http://127.0.0.1:8090). The console sends
 real requests only. Create a target, discover its model catalog, then launch a
 component or suite run. It provides:
 
+### Run the first probe
+
+The console includes a **使用指南** button on every page and shows a three-step
+onboarding panel until the first run exists. The shortest safe path is:
+
+1. Open **添加 API 目标**, choose a provider or enter an OpenAI-compatible Base
+   URL, and set the default model. Do not save a plaintext API key on the target.
+   Provider presets use their registered standard endpoint. If a vendor gives
+   you a workspace-specific hostname, edit the Base URL; the console switches
+   the target to **自定义兼容端点** so the saved provider and address cannot
+   contradict each other.
+2. Open **发起探测** and select **单项探针 → 文本聊天 → 本地执行器**. For a
+   cloud target, enter the temporary API key for that run only. The **直接探测**
+   action on each saved target opens this page with the target and its default
+   model already selected; the launch action remains disabled until a cloud
+   target has its one-use key.
+3. Confirm the displayed maximum call count, start the probe, and read the
+   `PASS`, `WARN`, `FAIL`, or `UNKNOWN` conclusion before opening its detailed
+   protocol, timing, and quality evidence.
+
+Model discovery is optional because some private or workspace endpoints do not
+implement `/models`. In that case, keep the vendor's documented model ID as the
+target default and launch a bounded probe directly.
+
+Suites, Temporal, continuous monitoring, and the diagnostic Agent are optional
+follow-on workflows; they are not required for the first probe.
+
 - live run state plus availability, protocol, performance, and quality scores;
 - a persisted seven-stage component flow that shows the current detection step,
   completed checks, failure stop, skipped work, per-step duration, and safe facts;

@@ -1,5 +1,5 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { onlineManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
@@ -18,8 +18,62 @@ const bootstrap = {
 
 describe("observatory console", () => {
   afterEach(() => {
+    onlineManager.setOnline(true);
     cleanup();
     vi.restoreAllMocks();
+  });
+
+  it("gives a first-time operator an actionable three-step probe path", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const data = url.includes("/bootstrap") ? bootstrap : [];
+      return new Response(JSON.stringify({ data }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/"]}>
+          <App />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByRole("heading", { name: "第一次探测，从这里开始" })).toBeInTheDocument();
+    expect(screen.getAllByText("添加 API 目标").length).toBeGreaterThan(0);
+    expect(screen.getByText("运行推荐探针")).toBeInTheDocument();
+    expect(screen.getByText("读懂探测结果")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /添加第一个目标/ })).toHaveAttribute("href", "/targets");
+  });
+
+  it("opens a plain-language guide from the global navigation", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const data = url.includes("/bootstrap") ? bootstrap : [];
+      return new Response(JSON.stringify({ data }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/"]}>
+          <App />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "使用指南" }));
+    const guide = screen.getByRole("dialog", { name: "快速使用指南" });
+    expect(within(guide).getByRole("heading", { name: "四步完成一次可信探测" })).toBeInTheDocument();
+    expect(within(guide).getByText(/第一次建议/)).toBeInTheDocument();
+    expect(within(guide).getByRole("link", { name: "去添加目标" })).toHaveAttribute("href", "/targets");
+    expect(within(guide).getByRole("link", { name: "去发起探测" })).toHaveAttribute("href", "/runs/new");
   });
 
   it("renders the target control plane without exposing a saved API key field", async () => {
@@ -46,6 +100,168 @@ describe("observatory console", () => {
     expect(screen.queryByLabelText("API Key")).not.toBeInTheDocument();
   });
 
+  it("switches a provider preset to a custom endpoint when its base URL changes", async () => {
+    const provider = {
+      id: "dashscope",
+      name: "阿里云百炼",
+      english_name: "Alibaba Cloud Model Studio",
+      target_kind: "cloud",
+      base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      default_model: "qwen-plus",
+      docs_url: "https://example.invalid/dashscope-docs",
+    };
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const data = url.includes("/bootstrap") ? { ...bootstrap, providers: [provider] } : [];
+      return new Response(JSON.stringify({ data }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/targets"]}><App /></MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "新增目标" }));
+    const providerSelect = screen.getByLabelText("Provider");
+    const baseUrl = screen.getByLabelText("Base URL");
+    fireEvent.change(providerSelect, { target: { value: provider.id } });
+
+    expect(providerSelect).toHaveValue(provider.id);
+    expect(baseUrl).toHaveValue(provider.base_url);
+    expect(screen.getByText(/标准端点/)).toBeInTheDocument();
+
+    fireEvent.change(baseUrl, {
+      target: { value: "https://workspace.example.invalid/compatible-mode/v1" },
+    });
+
+    await waitFor(() => expect(providerSelect).toHaveValue(""));
+    expect(screen.getByText(/已切换为自定义兼容端点/)).toBeInTheDocument();
+  });
+
+  it("links a saved target directly into a preselected run composer", async () => {
+    const target = {
+      id: "00000000-0000-4000-8000-000000000041",
+      name: "Direct probe target",
+      target_kind: "local",
+      provider_id: null,
+      base_url: "http://127.0.0.1:8091/v1",
+      default_model: "direct-model",
+      credential_ref: null,
+      credential_ref_configured: false,
+      version: 1,
+      created_at: "2026-07-20T00:00:00Z",
+      updated_at: "2026-07-20T00:00:00Z",
+      archived_at: null,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const data = url.includes("/bootstrap") ? bootstrap : url.includes("/targets") ? [target] : [];
+      return new Response(JSON.stringify({ data }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { unmount } = render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/targets"]}><App /></MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByRole("link", { name: "直接探测" })).toHaveAttribute("href", `/runs/new?target=${target.id}`);
+    unmount();
+
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={[`/runs/new?target=${target.id}`]}><App /></MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByRole("radio", { name: /Direct probe target/ })).toBeChecked();
+    await waitFor(() => expect(screen.getByLabelText("本次使用的模型 ID")).toHaveValue("direct-model"));
+  });
+
+  it("requires a temporary key before a local run against a cloud target", async () => {
+    const target = {
+      id: "00000000-0000-4000-8000-000000000042",
+      name: "Cloud run target",
+      target_kind: "cloud",
+      provider_id: null,
+      base_url: "https://cloud-run.example.invalid/v1",
+      default_model: "cloud-model",
+      credential_ref: null,
+      credential_ref_configured: false,
+      version: 1,
+      created_at: "2026-07-20T00:00:00Z",
+      updated_at: "2026-07-20T00:00:00Z",
+      archived_at: null,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const data = url.includes("/bootstrap") ? bootstrap : url.includes("/targets") ? [target] : [];
+      return new Response(JSON.stringify({ data }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={[`/runs/new?target=${target.id}`]}><App /></MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByRole("radio", { name: /Cloud run target/ })).toBeChecked();
+    const launch = screen.getByRole("button", { name: /开始探测/ });
+    const keyInput = screen.getByLabelText(/本次 API Key/);
+    expect(launch).toBeDisabled();
+    expect(screen.getByText(/云端目标必须输入本次临时 Key/)).toBeInTheDocument();
+    fireEvent.submit(launch.closest("form")!);
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/runs"))).toBe(false);
+
+    fireEvent.change(keyInput, { target: { value: "   " } });
+    expect(launch).toBeDisabled();
+    fireEvent.change(keyInput, { target: { value: "test-cloud-run-key" } });
+    expect(launch).toBeEnabled();
+  });
+
+  it("clears a temporary run key when the selected target changes", async () => {
+    const targets = ["A", "B"].map((name, index) => ({
+      id: `00000000-0000-4000-8000-00000000005${index}`,
+      name: `Cloud target ${name}`,
+      target_kind: "cloud",
+      provider_id: null,
+      base_url: `https://cloud-${name.toLowerCase()}.example.invalid/v1`,
+      default_model: `model-${name.toLowerCase()}`,
+      credential_ref: null,
+      credential_ref_configured: false,
+      version: 1,
+      created_at: "2026-07-20T00:00:00Z",
+      updated_at: "2026-07-20T00:00:00Z",
+      archived_at: null,
+    }));
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const data = url.includes("/bootstrap") ? bootstrap : url.includes("/targets") ? targets : [];
+      return new Response(JSON.stringify({ data }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/runs/new"]}><App /></MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole("radio", { name: /Cloud target A/ }));
+    const keyInput = screen.getByLabelText(/本次 API Key/);
+    fireEvent.change(keyInput, { target: { value: "test-target-a-only-key" } });
+    expect(screen.getByRole("button", { name: /开始探测/ })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("radio", { name: /Cloud target B/ }));
+    await waitFor(() => expect(keyInput).toHaveValue(""));
+    expect(screen.getByRole("button", { name: /开始探测/ })).toBeDisabled();
+  });
+
   it("clears a temporary catalog key immediately after discovery", async () => {
     const cloudTarget = {
       id: "00000000-0000-4000-8000-000000000001",
@@ -61,7 +277,7 @@ describe("observatory console", () => {
       updated_at: "2026-07-20T00:00:00Z",
       archived_at: null,
     };
-    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       const data = url.includes("/bootstrap")
         ? bootstrap
@@ -72,7 +288,8 @@ describe("observatory console", () => {
         status: 200,
         headers: { "Content-Type": "application/json" },
       });
-    }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={client}>
@@ -82,11 +299,152 @@ describe("observatory console", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "发现模型" }));
     const keyInput = await screen.findByLabelText("临时 API Key");
-    fireEvent.change(keyInput, { target: { value: "sk-temporary-browser-only" } });
+    const discoverButton = screen.getByRole("button", { name: "连接并读取模型" });
+    expect(discoverButton).toBeDisabled();
+    expect(screen.getByText(/生产凭据引用仅供 Temporal Worker 使用/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "跳过发现，直接发起探测" })).toHaveAttribute("href", `/runs/new?target=${cloudTarget.id}`);
+    fireEvent.click(discoverButton);
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/catalog"))).toBe(false);
+
+    const secret = "sk-temporary-browser-only";
+    fireEvent.change(keyInput, { target: { value: secret } });
+    expect(discoverButton).toBeEnabled();
+    fireEvent.click(discoverButton);
+
+    await waitFor(() => expect(keyInput).toHaveValue(""));
+    expect(JSON.stringify(client.getMutationCache().getAll().map((mutation) => mutation.state))).not.toContain(secret);
+    await screen.findByText("MODELS REPORTED");
+  });
+
+  it("clears a catalog key on failure without retaining it in mutation state", async () => {
+    const cloudTarget = {
+      id: "00000000-0000-4000-8000-000000000021",
+      name: "Failing cloud relay",
+      target_kind: "cloud",
+      provider_id: null,
+      base_url: "https://failure.example.invalid/v1",
+      default_model: "chat-model",
+      credential_ref: null,
+      credential_ref_configured: false,
+      version: 1,
+      created_at: "2026-07-20T00:00:00Z",
+      updated_at: "2026-07-20T00:00:00Z",
+      archived_at: null,
+    };
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/catalog")) {
+        return new Response(JSON.stringify({ error: { code: "UPSTREAM_ERROR", message: "safe catalog failure", details: null, request_id: "catalog-test" } }), {
+          status: 502,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      const data = url.includes("/bootstrap") ? bootstrap : [cloudTarget];
+      return new Response(JSON.stringify({ data }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/targets"]}><App /></MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "发现模型" }));
+    const keyInput = screen.getByLabelText("临时 API Key");
+    const secret = "test-catalog-failure-key";
+    fireEvent.change(keyInput, { target: { value: secret } });
     fireEvent.click(screen.getByRole("button", { name: "连接并读取模型" }));
 
-    await screen.findByText("MODELS REPORTED");
     await waitFor(() => expect(keyInput).toHaveValue(""));
+    await screen.findByText(/safe catalog failure/);
+    expect(JSON.stringify(client.getMutationCache().getAll().map((mutation) => mutation.state))).not.toContain(secret);
+  });
+
+  it("consumes a catalog key immediately instead of queuing it while offline", async () => {
+    const cloudTarget = {
+      id: "00000000-0000-4000-8000-000000000022",
+      name: "Offline browser relay",
+      target_kind: "cloud",
+      provider_id: null,
+      base_url: "https://offline.example.invalid/v1",
+      default_model: "chat-model",
+      credential_ref: null,
+      credential_ref_configured: false,
+      version: 1,
+      created_at: "2026-07-20T00:00:00Z",
+      updated_at: "2026-07-20T00:00:00Z",
+      archived_at: null,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const data = url.includes("/bootstrap")
+        ? bootstrap
+        : url.includes("/catalog")
+          ? { models: [], model_count: 0 }
+          : [cloudTarget];
+      return new Response(JSON.stringify({ data }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/targets"]}><App /></MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "发现模型" }));
+    const keyInput = screen.getByLabelText("临时 API Key");
+    const secret = "test-offline-catalog-key";
+    fireEvent.change(keyInput, { target: { value: secret } });
+    onlineManager.setOnline(false);
+    fireEvent.click(screen.getByRole("button", { name: "连接并读取模型" }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/catalog"))).toBe(true));
+    expect(keyInput).toHaveValue("");
+    expect(JSON.stringify(client.getMutationCache().getAll().map((mutation) => mutation.state))).not.toContain(secret);
+  });
+
+  it("prevents another catalog dialog while a previous request is in flight", async () => {
+    const targets = ["A", "B"].map((name, index) => ({
+      id: `00000000-0000-4000-8000-00000000003${index}`,
+      name: `Cloud relay ${name}`,
+      target_kind: "cloud",
+      provider_id: null,
+      base_url: `https://${name.toLowerCase()}.example.invalid/v1`,
+      default_model: "chat-model",
+      credential_ref: null,
+      credential_ref_configured: false,
+      version: 1,
+      created_at: "2026-07-20T00:00:00Z",
+      updated_at: "2026-07-20T00:00:00Z",
+      archived_at: null,
+    }));
+    let resolveCatalog: ((response: Response) => void) | undefined;
+    const pendingCatalog = new Promise<Response>((resolve) => { resolveCatalog = resolve; });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/catalog")) return pendingCatalog;
+      const data = url.includes("/bootstrap") ? bootstrap : targets;
+      return new Response(JSON.stringify({ data }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/targets"]}><App /></MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click((await screen.findAllByRole("button", { name: "发现模型" }))[0]);
+    fireEvent.change(screen.getByLabelText("临时 API Key"), { target: { value: "test-inflight-catalog-key" } });
+    fireEvent.click(screen.getByRole("button", { name: "连接并读取模型" }));
+    fireEvent.click(within(screen.getByRole("dialog", { name: "模型目录" })).getByRole("button", { name: "关闭" }));
+
+    expect(screen.queryByRole("dialog", { name: "模型目录" })).not.toBeInTheDocument();
+    const blockedButtons = await screen.findAllByRole("button", { name: "发现中…" });
+    blockedButtons.forEach((button) => expect(button).toBeDisabled());
+
+    resolveCatalog?.(new Response(JSON.stringify({ data: { models: [], model_count: 0 } }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    await waitFor(() => screen.getAllByRole("button", { name: "发现模型" }).forEach((button) => expect(button).toBeEnabled()));
   });
 
   it("shows but disables Temporal when the backend is unavailable", async () => {
@@ -105,7 +463,7 @@ describe("observatory console", () => {
       </QueryClientProvider>,
     );
 
-    expect(await screen.findByRole("heading", { name: "编排一次有界质量探测" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "发起一次探测" })).toBeInTheDocument();
     expect(screen.getByRole("radio", { name: /Temporal 工作流/ })).toBeDisabled();
     expect(screen.getAllByText("OFFLINE").length).toBeGreaterThan(0);
   });
@@ -277,12 +635,14 @@ describe("observatory console", () => {
     );
 
     fireEvent.click(await screen.findByRole("radio", { name: /Local authenticated relay/ }));
-    await waitFor(() => expect(screen.getByLabelText("模型 ID")).toHaveValue("mock-model"));
+    await waitFor(() => expect(screen.getByLabelText("本次使用的模型 ID")).toHaveValue("mock-model"));
     const keyInput = screen.getByLabelText(/可选本地鉴权 Key/);
     const secret = "test-browser-transient-key";
     fireEvent.change(keyInput, { target: { value: secret } });
-    fireEvent.click(screen.getByRole("button", { name: /冻结配置并发起/ }));
+    onlineManager.setOnline(false);
+    fireEvent.click(screen.getByRole("button", { name: /开始探测/ }));
 
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/runs"))).toBe(true));
     await screen.findByText(/safe failure/);
     const post = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith("/runs") && Boolean(init?.body));
     expect(post).toBeDefined();
