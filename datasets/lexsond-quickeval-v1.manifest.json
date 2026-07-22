@@ -1,0 +1,26 @@
+{
+  "slug": "lexsond-quickeval",
+  "name": "Lexsond QuickEval v1",
+  "version": "1.0.0",
+  "scope": "SYSTEM",
+  "license_spdx": "Apache-2.0",
+  "license_url": "https://www.apache.org/licenses/LICENSE-2.0",
+  "distribution_policy": "BUNDLED",
+  "authors": [
+    "Lexsond Contributors"
+  ],
+  "authorship": "Project-original prompts and references; deterministic programmatic validation plus manual category review.",
+  "item_count": 80,
+  "categories": {
+    "arithmetic": 10,
+    "classification": 10,
+    "en_instruction": 10,
+    "extraction": 10,
+    "json_structure": 10,
+    "logic": 10,
+    "reading": 10,
+    "zh_instruction": 10
+  },
+  "content_sha256": "283add097ec575cf35ebda94d4ed9e75218a7745c78136368fda972bba2c9d69",
+  "schema_version": "lexsond.evaluation-dataset/v1"
+}

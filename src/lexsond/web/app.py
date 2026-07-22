@@ -797,7 +797,7 @@ def create_app(
                 request.cookies.get(SESSION_COOKIE_NAME)
             )
             value = {
-                "user": dict(resumed.principal),
+                "user": _public_principal(resumed.principal),
                 "csrf_token": resumed.csrf_secret.consume(),
                 "auth_mode": auth_configuration.mode.value,
             }
@@ -2200,6 +2200,24 @@ def _workspace_write_allowed(role: str, method: str, path: str) -> bool:
     if path.startswith("/api/v1/evaluation-runs/") and path.endswith("/cancel"):
         return True
     return path.startswith("/api/v1/agent/")
+
+
+def _public_principal(principal: Mapping[str, Any]) -> dict[str, Any]:
+    """Project an authenticated identity onto the browser-safe user contract."""
+
+    fields = (
+        "user_id",
+        "email",
+        "display_name",
+        "avatar_url",
+        "status",
+        "system_role",
+        "email_verified_at",
+        "workspace_id",
+        "workspace_name",
+        "workspace_role",
+    )
+    return {field: principal[field] for field in fields}
 
 
 def _deliver_password_reset_safely(

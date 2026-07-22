@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lexsond.local/schemas/evaluation-dataset-v1.json",
+  "title": "Lexsond Evaluation Dataset Item v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "category", "language", "input", "reference", "metadata"],
+  "properties": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
+    "category": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"},
+    "language": {"type": "string", "pattern": "^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$"},
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["messages"],
+      "properties": {
+        "messages": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["role", "content"],
+            "properties": {
+              "role": {"enum": ["system", "user", "assistant"]},
+              "content": {"type": "string", "minLength": 1, "maxLength": 32768}
+            }
+          }
+        },
+        "choices": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 26,
+          "items": {"type": "string", "minLength": 1, "maxLength": 4096}
+        }
+      }
+    },
+    "reference": {
+      "type": "object",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "required": ["scorer", "answer"],
+          "properties": {
+            "scorer": {"enum": ["exact_match", "normalized_exact_match", "token_f1"]},
+            "answer": {"type": "string", "minLength": 1, "maxLength": 32768}
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["scorer", "answer_index"],
+          "properties": {
+            "scorer": {"const": "multiple_choice_accuracy"},
+            "answer_index": {"type": "integer", "minimum": 0, "maximum": 25}
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["scorer", "values"],
+          "properties": {
+            "scorer": {"const": "contains_all"},
+            "values": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "string", "minLength": 1, "maxLength": 1024}}
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["scorer", "pattern"],
+          "properties": {
+            "scorer": {"const": "regex_match"},
+            "pattern": {"type": "string", "minLength": 1, "maxLength": 256}
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["scorer", "schema"],
+          "properties": {
+            "scorer": {"const": "json_schema_valid"},
+            "schema": {"type": "object"}
+          }
+        }
+      ]
+    },
+    "metadata": {"type": "object"}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "reference": {
+            "properties": {"scorer": {"const": "multiple_choice_accuracy"}},
+            "required": ["scorer"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "input": {"required": ["messages", "choices"]}
+        }
+      }
+    }
+  ]
+}
