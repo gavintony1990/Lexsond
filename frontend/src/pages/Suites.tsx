@@ -7,6 +7,7 @@ import { z } from "zod";
 import { api } from "../api";
 import type { Suite, SuiteDocument } from "../types";
 import { EmptyState, ErrorNotice, formatTime, PageHead, StatusPill } from "../ui";
+import { SuiteModuleTabs } from "./SuiteModuleTabs";
 
 const schema = z.object({
   name: z.string().min(1).max(120),
@@ -78,6 +79,7 @@ export function Suites() {
 
   return (
     <div className="page-stack">
+      <SuiteModuleTabs />
       <PageHead eyebrow="CANARY LIBRARY / 套件库" title="把质量意图冻结成可运行规范" description="第一版编辑器严格覆盖 openai-chat 金丝雀：采样、预算、并发和断言都在发请求前完成校验。" action={<button className="primary-action" onClick={() => setEditing("new")}><Plus size={16} />创建套件</button>} />
       {(suites.error || save.error) && <ErrorNotice error={suites.error || save.error} />}
       <div className="toolbar panel-lite"><div className="toolbar-caption"><FlaskConical size={15} /><b>{suites.data?.length ?? 0}</b> 个有界套件</div><label className="toggle-label"><input type="checkbox" checked={showArchived} onChange={(event) => setShowArchived(event.target.checked)} /><span />显示已归档</label></div>

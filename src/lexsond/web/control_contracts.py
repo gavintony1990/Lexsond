@@ -30,6 +30,8 @@ _REQUIRED_POSTGRES_STORE_METHODS = (
     "fail_monitor_policy_dispatch",
     "prune_monitoring_data",
     "record_monitor_run",
+    "get_run_system",
+    "cancel_run_system",
 )
 
 

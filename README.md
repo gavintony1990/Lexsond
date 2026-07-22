@@ -22,7 +22,7 @@ Temporal, and PostgreSQL are pinned optional boundaries around that core:
   90-minute/24-hour/7-day/30-day availability heatmaps;
 - a LangChain Agent workbench with bounded Tools, Skills, and repository-backed memory;
 - PostgreSQL repositories for target, suite-revision, run, workflow, monitoring,
-  and Agent-session state.
+  Agent-session, and immutable evaluation-dataset state.
 
 ## Open the visual console
 
@@ -33,6 +33,7 @@ cd Lexsond
 python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[production]'
 export LEXSOND_POSTGRES_DSN='postgresql://probe_control@127.0.0.1/probe'
+export LEXSOND_AUTH_MODE='local-single-user'
 cd frontend
 npm install
 npm run build
@@ -41,7 +42,7 @@ cd ..
 ```
 
 Apply `migrations/0001_core.sql` through
-`migrations/0006_suite_secret_value_guard.sql` with a migration-owner connection
+`migrations/0011_evaluations.sql` in numeric order with a migration-owner connection
 before the final command. The control plane intentionally has no embedded
 database fallback.
 
@@ -50,6 +51,25 @@ For React development, run `npm run dev` in `frontend/`; Vite proxies
 origin. Open [http://127.0.0.1:8090](http://127.0.0.1:8090). The console sends
 real requests only. Create a target, discover its model catalog, then launch a
 component or suite run. It provides:
+
+`LEXSOND_AUTH_MODE` defaults to `required`. Use `local-single-user` only with a
+numeric loopback listener such as `127.0.0.1`; startup rejects that mode on
+`0.0.0.0`, a LAN address, or a public listener. Required mode needs SMTP for
+registration and account recovery:
+
+```bash
+export LEXSOND_AUTH_MODE='required'
+export LEXSOND_PUBLIC_BASE_URL='https://lexsond.example.com'
+export LEXSOND_SMTP_HOST='smtp.example.com'
+export LEXSOND_SMTP_FROM='noreply@example.com'
+export LEXSOND_SMTP_USERNAME='secret-manager-injected-user'
+export LEXSOND_SMTP_PASSWORD='secret-manager-injected-password'
+```
+
+The browser receives an opaque `HttpOnly` Session cookie and keeps CSRF only in
+memory. Password reset/action tokens are one-use and hashed in PostgreSQL;
+password reset and password change revoke every existing Session. GitHub and
+Google OAuth adapters are not enabled yet.
 
 ### Run the first probe
 
@@ -104,11 +124,48 @@ secret-free Workflow input before asynchronous dispatch; a restarted control
 process attaches to the same deterministic Workflow ID and projects source
 events idempotently.
 
-API keys are `SecretStr` request fields used only for model discovery or one
-local run. React clears them after submission. They are not returned, logged, or
-written to PostgreSQL/SSE/Temporal History. Temporal targets instead keep
-a non-secret `credential_ref`; the worker resolves the value from its approved
-environment/secret-manager binding.
+API keys are `SecretStr` request fields used at model-discovery or execution
+boundaries. React clears temporary values after submission. In loopback
+`local-single-user` mode a user may explicitly save a key to the operating
+system credential service; PostgreSQL stores only workspace-scoped metadata,
+an internal random locator, a masked suffix, and an HMAC fingerprint. Required
+cloud mode fails closed until an external Secret Manager adapter is configured.
+Keys are never returned, logged, or written to PostgreSQL/SSE/Temporal History.
+Temporal targets instead keep a non-secret `credential_ref`; the worker resolves
+the value from its approved environment/secret-manager binding.
+
+The **API Key 模型探测** module freezes one successful catalog snapshot and can
+probe 1–10 visible models. `smoke` performs exactly one non-streaming, at-most
+8-token generation per model with total concurrency capped at two; `catalog_only`
+does not generate, while `quality_suite` applies one immutable suite revision.
+Unknown prices require explicit confirmation, and 401/403/schema failures are
+not retried. The batch, child-run references, bounded progress events, and
+cancel intent are durable in PostgreSQL without the credential value.
+
+### Evaluation datasets and model benchmarking
+
+**探测套件管理** now contains **探测套件、评测数据集、评分器、评测记录**
+tabs. `Lexsond QuickEval v1` ships as an Apache-2.0, project-original system
+dataset with 80 deterministic text items. Workspace members can validate and
+upload bounded UTF-8 JSONL/CSV, preview the parsed shape, and create immutable,
+content-hashed revisions.
+
+An evaluation selects one immutable dataset revision, one channel and catalog
+snapshot, one temporary or saved credential, and 1–10 visible models. Sampling
+is deterministic, concurrency is capped at two, every model/item has exactly one
+provider attempt, and unknown prices require explicit confirmation. Results keep
+scores, confidence intervals, category metrics, usage/cost completeness, timing,
+safe facts, and an output SHA-256; ordinary PostgreSQL tables never retain the
+complete model answer. See
+[`docs/evaluation-datasets.md`](docs/evaluation-datasets.md) and
+[`docs/adr/011-evaluation-datasets-and-benchmarking.md`](docs/adr/011-evaluation-datasets-and-benchmarking.md).
+
+In authenticated cloud mode, set `LEXSOND_CREDENTIAL_BINDING_KEY` to the same
+Secret-Manager-provided value (at least 32 printable characters) for every web
+worker. It binds model discovery to later execution and must not be logged or
+committed. Unknown source prices cannot enforce a USD ceiling; the preview and
+result explicitly report this while request-count, Token, concurrency, timeout,
+and cancellation guards remain active.
 
 ### Continuous monitoring
 
@@ -356,7 +413,7 @@ RUN_POSTGRES_TESTS=1 PYTHONPATH=src \
 ## Run the PostgreSQL-backed control plane and Temporal worker
 
 PostgreSQL is the only structured persistent-memory backend. Apply
-`0001_core.sql` through `0006_suite_secret_value_guard.sql` with a migration-owner
+`0001_core.sql` through `0011_evaluations.sql` with a migration-owner
 connection before starting either process. The content-addressed file evidence
 store remains an explicit artifact-byte boundary; it is not a second metadata,
 workflow, or Agent-memory database.
@@ -384,6 +441,7 @@ export LEXSOND_TEMPORAL_TARGET='temporal:7233'
 export LEXSOND_TEMPORAL_NAMESPACE='default'
 export LEXSOND_TEMPORAL_TASK_QUEUE='lexsond-canary-cn-east-1'
 export LEXSOND_REGION='cn-east-1'
+export LEXSOND_AUTH_MODE='required'
 lexsond-web --host 0.0.0.0 --port 8090
 ```
 
@@ -540,6 +598,10 @@ Deferred to the next slices:
   recurring-policy leases, idempotency, health transitions, retention, and SSRF boundaries.
 - [`docs/adr/009-postgresql-only-persistence.md`](docs/adr/009-postgresql-only-persistence.md):
   PostgreSQL-only persistent memory and the retained evidence-artifact boundary.
+- [`docs/adr/010-auth-workspace-tenancy.md`](docs/adr/010-auth-workspace-tenancy.md):
+  server Sessions, CSRF, Personal Workspaces, tenant isolation, and credential-vault boundaries.
+- [`docs/adr/011-evaluation-datasets-and-benchmarking.md`](docs/adr/011-evaluation-datasets-and-benchmarking.md):
+  immutable datasets, deterministic scorers, exact-call evaluation, license policy, and raw-output boundaries.
 - [`docs/relay-pulse-porting-analysis.md`](docs/relay-pulse-porting-analysis.md):
   clean-room comparison with relay-pulse and the accepted/deferred feature matrix.
 - [`schemas/canary-workflow-input.schema.json`](schemas/canary-workflow-input.schema.json)

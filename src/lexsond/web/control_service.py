@@ -11,7 +11,9 @@ from functools import wraps
 from pathlib import Path
 from queue import Queue
 from typing import Any, Mapping, Protocol, Sequence
-from uuid import uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
+
+from pydantic import SecretStr
 
 from ..agent.service import AgentCoordinator
 from ..monitoring.scheduler import MonitorScheduler
@@ -35,6 +37,9 @@ from ..workflows import WorkflowEvent, WorkflowEventType
 from .api_models import (
     MonitorPolicyCreate,
     MonitorPolicyPatch,
+    PartnerApplicationCreate,
+    PartnerApplicationPatch,
+    ProbeBatchCreate,
     RunCreate,
     SuiteCreate,
     SuitePatch,
@@ -384,11 +389,12 @@ class ControlPlaneService:
             elif run.get("cancel_requested_at") is not None:
                 self._submit_background(self._retry_temporal_cancel, run["run_id"])
 
-    def bootstrap(self) -> dict[str, Any]:
-        runs = self.store.list_runs(limit=100)
+    def bootstrap(self, *, workspace_id: str | None = None) -> dict[str, Any]:
+        store = self._workspace_store(workspace_id)
+        runs = store.list_runs(limit=100)
         terminal = [run for run in runs if run["state"] != "RUNNING"]
         passed = [run for run in terminal if run["result_status"] == "PASS"]
-        monitor_policies = self.store.list_monitor_policies()
+        monitor_policies = store.list_monitor_policies()
         return {
             "product": {
                 "name": "Lexsond",
@@ -422,20 +428,74 @@ class ControlPlaneService:
                 "pass_rate": (
                     round(len(passed) / len(terminal) * 100, 1) if terminal else None
                 ),
-                "targets": len(self.store.list_targets()),
-                "suites": len(self.store.list_suites()),
-                "agent_sessions": len(self.store.list_agent_sessions()),
+                "targets": len(store.list_targets()),
+                "suites": len(store.list_suites()),
+                "agent_sessions": len(store.list_agent_sessions()),
                 "monitor_policies": len(monitor_policies),
             },
         }
 
+    # Partner onboarding
+
+    def create_partner_application(
+        self,
+        model: PartnerApplicationCreate,
+        *,
+        idempotency_key: str,
+        workspace_id: str,
+    ) -> dict[str, Any]:
+        try:
+            normalized_idempotency = str(UUID(idempotency_key))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("Idempotency-Key must be a UUID") from exc
+        value = model.model_dump(mode="json")
+        value["idempotency_key"] = normalized_idempotency
+        value["request_sha256"] = hashlib.sha256(
+            canonical_json_bytes(model.model_dump(mode="json"))
+        ).hexdigest()
+        return self._workspace_store(workspace_id).create_partner_application(value)
+
+    def update_partner_application(
+        self,
+        application_id: str,
+        model: PartnerApplicationPatch,
+        *,
+        workspace_id: str,
+    ) -> dict[str, Any]:
+        value = model.model_dump(mode="json")
+        version = int(value.pop("version"))
+        return self._workspace_store(workspace_id).update_partner_application(
+            application_id, value, expected_version=version
+        )
+
     # Target management
 
-    def create_target(self, model: TargetCreate) -> dict[str, Any]:
-        return self.store.create_target(model.model_dump())
+    def _workspace_store(self, workspace_id: str | None) -> Any:
+        if workspace_id is None:
+            return self.store
+        return self.store.for_workspace(workspace_id)
 
-    def update_target(self, target_id: str, patch: TargetPatch) -> dict[str, Any]:
-        current = self.store.get_target(target_id)
+    def agent_for_workspace(self, workspace_id: str) -> AgentCoordinator:
+        return AgentCoordinator(
+            self.store.for_workspace(workspace_id),
+            model_factory=self.agent.model_factory,
+            credential_validator=self._validate_temporary_key_binding,
+        )
+
+    def create_target(
+        self, model: TargetCreate, *, workspace_id: str | None = None
+    ) -> dict[str, Any]:
+        return self._workspace_store(workspace_id).create_target(model.model_dump())
+
+    def update_target(
+        self,
+        target_id: str,
+        patch: TargetPatch,
+        *,
+        workspace_id: str | None = None,
+    ) -> dict[str, Any]:
+        store = self._workspace_store(workspace_id)
+        current = store.get_target(target_id)
         fields = patch.model_fields_set - {"version"}
         changes = {field: getattr(patch, field) for field in fields}
         merged = {
@@ -448,14 +508,24 @@ class ControlPlaneService:
         }
         validated = TargetCreate.model_validate(merged).model_dump()
         normalized_changes = {field: validated[field] for field in fields}
-        return self.store.update_target(
+        return store.update_target(
             target_id,
             normalized_changes,
             expected_version=patch.version,
         )
 
-    def target_catalog(self, target_id: str, api_key: str | None) -> dict[str, Any]:
-        target = self.store.get_target(target_id)
+    def target_catalog(
+        self,
+        target_id: str,
+        api_key: str | None,
+        *,
+        workspace_id: str | None = None,
+        credential_profile_id: str | None = None,
+        credential_fingerprint: str | None = None,
+        credential_version: int | None = None,
+    ) -> dict[str, Any]:
+        store = self._workspace_store(workspace_id)
+        target = store.get_target(target_id)
         if target["target_kind"] == "cloud" and not api_key:
             raise ValueError("api_key is required for cloud targets")
         if api_key is not None:
@@ -466,23 +536,266 @@ class ControlPlaneService:
             api_key=api_key,
             provider_id=target["provider_id"],
         )
+        public_entries = [entry.to_public_dict() for entry in entries]
+        snapshot = store.create_model_catalog_snapshot(
+            {
+                "target_id": target_id,
+                "credential_profile_id": credential_profile_id,
+                "credential_fingerprint": credential_fingerprint,
+                "credential_version": credential_version,
+                "target_version": target["version"],
+                "target_base_url": target["base_url"],
+                "target_kind": target["target_kind"],
+                "protocol": "openai-compatible",
+                "provider_id": target["provider_id"],
+                "models": public_entries,
+            }
+        )
         return {
             "status": "CONNECTED",
             "target_id": target_id,
             "auth_mode": "bearer" if api_key else "none",
             "model_count": len(entries),
-            "models": [entry.to_public_dict() for entry in entries],
+            "models": public_entries,
+            "catalog_snapshot_id": snapshot["snapshot_id"],
+            "catalog_expires_at": snapshot["expires_at"],
         }
+
+    # Bounded multi-model batches
+
+    @_lifecycle_operation
+    def start_probe_batch(
+        self,
+        model: ProbeBatchCreate,
+        *,
+        workspace_id: str | None = None,
+        idempotency_key: str,
+        api_key_override: SecretStr | None = None,
+    ) -> dict[str, Any]:
+        normalized_idempotency = str(UUID(idempotency_key))
+        store = self._workspace_store(workspace_id)
+        target = store.get_target(str(model.target_id))
+        snapshot = store.get_model_catalog_snapshot(str(model.catalog_snapshot_id))
+        if snapshot["status"] != "FRESH":
+            raise ControlPlaneConflict("model catalog snapshot is stale")
+        if snapshot["target_id"] != str(model.target_id):
+            raise ControlPlaneConflict("catalog snapshot belongs to another channel")
+        if snapshot["target_version"] != target["version"]:
+            raise ControlPlaneConflict("channel changed after model discovery")
+        profile_id = (
+            str(model.credential_profile_id)
+            if model.credential_profile_id is not None
+            else None
+        )
+        if snapshot["credential_profile_id"] != profile_id:
+            if snapshot["credential_profile_id"] is not None or profile_id is not None:
+                raise ControlPlaneConflict(
+                    "batch credential does not match the catalog snapshot"
+                )
+        if model.mode != "catalog_only" and not model.confirm_unknown_cost:
+            raise ValueError(
+                "model pricing is unknown; confirm_unknown_cost is required"
+            )
+        if api_key_override is not None and model.api_key is not None:
+            raise ValueError("execution credential override conflicts with api_key")
+        execution_secret = api_key_override or model.api_key
+        api_key = (
+            execution_secret.get_secret_value()
+            if execution_secret is not None
+            else None
+        )
+        if api_key is not None:
+            validate_api_key_value(api_key)
+            self._validate_temporary_key_binding(target, api_key)
+        if target["target_kind"] == "cloud" and model.mode != "catalog_only" and not api_key:
+            raise ValueError("a credential is required for a cloud probe batch")
+        effective_max_output_tokens = model.max_output_tokens
+        effective_timeout_seconds = model.timeout_seconds
+        if model.mode == "quality_suite":
+            revision = store.get_suite_revision(str(model.suite_revision_id))
+            suite = compile_suite(revision["document"])
+            if suite.sampling.concurrency != 1:
+                raise ValueError(
+                    "quality_suite batch requires suite sampling concurrency 1"
+                )
+            effective_max_output_tokens = suite.request.max_output_tokens
+            effective_timeout_seconds = suite.sampling.timeout_seconds
+        durable = {
+            "target_id": str(model.target_id),
+            "credential_profile_id": profile_id,
+            "catalog_snapshot_id": str(model.catalog_snapshot_id),
+            "suite_revision_id": (
+                str(model.suite_revision_id)
+                if model.suite_revision_id is not None
+                else None
+            ),
+            "mode": model.mode,
+            "model_ids": model.model_ids,
+            "max_concurrency": model.max_concurrency,
+            "max_output_tokens": effective_max_output_tokens,
+            "timeout_seconds": effective_timeout_seconds,
+            "confirm_unknown_cost": model.confirm_unknown_cost,
+        }
+        request_sha256 = hashlib.sha256(canonical_json_bytes(durable)).hexdigest()
+        replay = store.find_probe_batch_by_idempotency(
+            normalized_idempotency, request_sha256
+        )
+        if replay is not None:
+            return replay
+        batch = store.create_probe_batch(
+            {
+                **durable,
+                "batch_id": str(uuid4()),
+                "idempotency_key": normalized_idempotency,
+                "request_sha256": request_sha256,
+            }
+        )
+        if model.mode == "catalog_only":
+            return store.finalize_probe_batch(batch["batch_id"])
+        else:
+            self._submit_background(
+                self._execute_probe_batch,
+                batch["batch_id"],
+                target["workspace_id"],
+                api_key,
+            )
+        return batch
+
+    def _execute_probe_batch(
+        self,
+        batch_id: str,
+        workspace_id: str,
+        api_key: str | None,
+    ) -> None:
+        store = self._workspace_store(workspace_id)
+        active: dict[str, str] = {}
+        while not self._closing.is_set():
+            batch = store.get_probe_batch(batch_id)
+            if batch["state"] != "RUNNING":
+                return
+            for item in batch["items"]:
+                if item["state"] == "RUNNING" and item["run_id"]:
+                    active[item["item_id"]] = item["run_id"]
+
+            if batch["cancel_requested_at"] is not None:
+                for item in batch["items"]:
+                    if item["state"] == "PENDING":
+                        store.finish_probe_batch_item(
+                            batch_id,
+                            item["item_id"],
+                            state="CANCELLED",
+                            failure_code="BATCH_CANCELLED",
+                        )
+                for run_id in tuple(active.values()):
+                    try:
+                        self.cancel_run(run_id, workspace_id=workspace_id)
+                    except (ControlPlaneConflict, ControlPlaneNotFound):
+                        pass
+            else:
+                pending = [
+                    item for item in batch["items"] if item["state"] == "PENDING"
+                ]
+                while pending and len(active) < batch["max_concurrency"]:
+                    item = pending.pop(0)
+                    try:
+                        child = RunCreate(
+                            target_id=UUID(batch["target_id"]),
+                            run_kind=(
+                                "suite" if batch["mode"] == "quality_suite" else "component"
+                            ),
+                            probe_type=ProbeType.CHAT,
+                            suite_revision_id=(
+                                UUID(batch["suite_revision_id"])
+                                if batch["suite_revision_id"] is not None
+                                else None
+                            ),
+                            execution_backend="local",
+                            model=item["model_id"],
+                            stream=False,
+                            timeout_seconds=batch["timeout_seconds"],
+                            max_output_tokens=batch["max_output_tokens"],
+                            credential_profile_id=(
+                                UUID(batch["credential_profile_id"])
+                                if batch["credential_profile_id"] is not None
+                                else None
+                            ),
+                        )
+                        child_idempotency = str(
+                            uuid5(
+                                NAMESPACE_URL,
+                                f"lexsond:probe-batch:{batch_id}:{item['item_id']}",
+                            )
+                        )
+                        run = self.start_run(
+                            child,
+                            workspace_id=workspace_id,
+                            idempotency_key=child_idempotency,
+                            api_key_override=(SecretStr(api_key) if api_key else None),
+                        )
+                        store.start_probe_batch_item(
+                            batch_id, item["item_id"], run["run_id"]
+                        )
+                        active[item["item_id"]] = run["run_id"]
+                    except Exception as exc:
+                        store.finish_probe_batch_item(
+                            batch_id,
+                            item["item_id"],
+                            state="FAILED",
+                            failure_code=_safe_batch_dispatch_failure(exc),
+                        )
+
+            for item_id, run_id in tuple(active.items()):
+                run = store.get_run(run_id, include_archived=True)
+                if run["state"] == "RUNNING":
+                    continue
+                if run["state"] == "COMPLETED" and run["result_status"] != "FAIL":
+                    state, failure_code = "COMPLETED", None
+                elif run["state"] == "CANCELLED":
+                    state, failure_code = "CANCELLED", "RUN_CANCELLED"
+                else:
+                    state = "FAILED"
+                    failure_code = run.get("failure_code") or "TARGET_ASSERTION_FAILED"
+                store.finish_probe_batch_item(
+                    batch_id,
+                    item_id,
+                    state=state,
+                    failure_code=failure_code,
+                )
+                active.pop(item_id, None)
+
+            refreshed = store.get_probe_batch(batch_id)
+            unfinished = any(
+                item["state"] in {"PENDING", "RUNNING"}
+                for item in refreshed["items"]
+            )
+            if not unfinished:
+                store.finalize_probe_batch(batch_id)
+                return
+            time.sleep(0.05)
+
+    @_lifecycle_operation
+    def cancel_probe_batch(
+        self, batch_id: str, *, workspace_id: str | None = None
+    ) -> dict[str, Any]:
+        return self._workspace_store(workspace_id).request_probe_batch_cancel(batch_id)
 
     # Suite management
 
-    def create_suite(self, model: SuiteCreate) -> dict[str, Any]:
-        return self.store.create_suite(model.model_dump())
+    def create_suite(
+        self, model: SuiteCreate, *, workspace_id: str | None = None
+    ) -> dict[str, Any]:
+        return self._workspace_store(workspace_id).create_suite(model.model_dump())
 
-    def update_suite(self, suite_id: str, patch: SuitePatch) -> dict[str, Any]:
+    def update_suite(
+        self,
+        suite_id: str,
+        patch: SuitePatch,
+        *,
+        workspace_id: str | None = None,
+    ) -> dict[str, Any]:
         fields = patch.model_fields_set - {"version"}
         changes = {field: getattr(patch, field) for field in fields}
-        return self.store.update_suite(
+        return self._workspace_store(workspace_id).update_suite(
             suite_id,
             changes,
             expected_version=patch.version,
@@ -490,16 +803,24 @@ class ControlPlaneService:
 
     # Continuous monitoring
 
-    def create_monitor_policy(self, model: MonitorPolicyCreate) -> dict[str, Any]:
-        value = self._validated_monitor_policy(model)
-        policy = self.store.create_monitor_policy(value)
+    def create_monitor_policy(
+        self, model: MonitorPolicyCreate, *, workspace_id: str | None = None
+    ) -> dict[str, Any]:
+        store = self._workspace_store(workspace_id)
+        value = self._validated_monitor_policy(model, store=store)
+        policy = store.create_monitor_policy(value)
         self.monitor_scheduler.wake()
         return policy
 
     def update_monitor_policy(
-        self, policy_id: str, patch: MonitorPolicyPatch
+        self,
+        policy_id: str,
+        patch: MonitorPolicyPatch,
+        *,
+        workspace_id: str | None = None,
     ) -> dict[str, Any]:
-        current = self.store.get_monitor_policy(policy_id)
+        store = self._workspace_store(workspace_id)
+        current = store.get_monitor_policy(policy_id)
         fields = patch.model_fields_set - {"version"}
         changes = {field: getattr(patch, field) for field in fields}
         merged = {
@@ -530,10 +851,10 @@ class ControlPlaneService:
             "enabled": changes.get("enabled", current["enabled"]),
         }
         validated = self._validated_monitor_policy(
-            MonitorPolicyCreate.model_validate(merged)
+            MonitorPolicyCreate.model_validate(merged), store=store
         )
         normalized = {field: validated[field] for field in fields}
-        policy = self.store.update_monitor_policy(
+        policy = store.update_monitor_policy(
             policy_id,
             normalized,
             expected_version=patch.version,
@@ -541,15 +862,20 @@ class ControlPlaneService:
         self.monitor_scheduler.wake()
         return policy
 
-    def request_monitor_policy_run(self, policy_id: str) -> dict[str, Any]:
-        policy = self.store.request_monitor_policy_run(policy_id)
+    def request_monitor_policy_run(
+        self, policy_id: str, *, workspace_id: str | None = None
+    ) -> dict[str, Any]:
+        policy = self._workspace_store(workspace_id).request_monitor_policy_run(
+            policy_id
+        )
         self.monitor_scheduler.wake()
         return policy
 
     def _validated_monitor_policy(
-        self, model: MonitorPolicyCreate
+        self, model: MonitorPolicyCreate, *, store: Any | None = None
     ) -> dict[str, Any]:
-        target = self.store.get_target(str(model.target_id))
+        repository = store or self.store
+        target = repository.get_target(str(model.target_id))
         if model.execution_backend == "local" and target["target_kind"] == "cloud":
             raise ValueError(
                 "recurring local execution cannot store a cloud API key; use Temporal credential_ref"
@@ -561,7 +887,7 @@ class ControlPlaneService:
                 raise ValueError("Temporal monitor policy requires target credential_ref")
         suite = None
         if model.suite_revision_id is not None:
-            revision = self.store.get_suite_revision(str(model.suite_revision_id))
+            revision = repository.get_suite_revision(str(model.suite_revision_id))
             suite = compile_suite(revision["document"])
         model_name = (model.model or target["default_model"]).strip()
         if not model_name:
@@ -598,6 +924,7 @@ class ControlPlaneService:
             model,
             idempotency_key=idempotency_key,
             monitor_policy_id=policy["id"],
+            workspace_id=policy["workspace_id"],
         )
         return run["run_id"]
 
@@ -608,11 +935,21 @@ class ControlPlaneService:
         self,
         model: RunCreate,
         *,
+        workspace_id: str | None = None,
         idempotency_key: str | None = None,
         monitor_policy_id: str | None = None,
+        api_key_override: SecretStr | None = None,
     ) -> dict[str, Any]:
-        target = self.store.get_target(str(model.target_id))
-        api_key = model.api_key.get_secret_value() if model.api_key is not None else None
+        store = self._workspace_store(workspace_id)
+        target = store.get_target(str(model.target_id))
+        if api_key_override is not None and model.api_key is not None:
+            raise ValueError("execution credential override conflicts with api_key")
+        execution_secret = api_key_override or model.api_key
+        api_key = (
+            execution_secret.get_secret_value()
+            if execution_secret is not None
+            else None
+        )
         if api_key is not None:
             validate_api_key_value(api_key)
             self._validate_temporary_key_binding(target, api_key)
@@ -629,7 +966,7 @@ class ControlPlaneService:
         suite_document: Mapping[str, Any] | None = None
         suite_revision_id: str | None = None
         if model.run_kind == "suite":
-            revision = self.store.get_suite_revision(str(model.suite_revision_id))
+            revision = store.get_suite_revision(str(model.suite_revision_id))
             suite_revision_id = revision["id"]
             suite_document = revision["document"]
             suite = compile_suite(suite_document)
@@ -674,6 +1011,7 @@ class ControlPlaneService:
             )
         )
         metadata = {
+            "workspace_id": target["workspace_id"],
             "target_id": target["id"],
             "suite_revision_id": suite_revision_id,
             "monitor_policy_id": monitor_policy_id,
@@ -689,10 +1027,22 @@ class ControlPlaneService:
             "timeout_seconds": (
                 suite.sampling.timeout_seconds if suite is not None else model.timeout_seconds
             ),
+            "max_output_tokens": (
+                suite.request.max_output_tokens
+                if suite is not None
+                else model.max_output_tokens
+            ),
             "audio_voice": audio_voice,
+            # A profile UUID is non-secret and binds idempotency to the selected
+            # credential without persisting a locator or the resolved value.
+            "credential_profile_id": (
+                str(model.credential_profile_id)
+                if model.credential_profile_id is not None
+                else None
+            ),
         }
         request_sha256 = hashlib.sha256(canonical_json_bytes(metadata)).hexdigest()
-        created_run = self.store.create_run(
+        created_run = store.create_run(
             run_id,
             metadata,
             workflow,
@@ -737,20 +1087,23 @@ class ControlPlaneService:
             except Exception:
                 self._mark_failed(run_id, "LOCAL_DISPATCH_ERROR")
                 raise
-        return self.store.get_run(run_id)
+        return store.get_run(run_id)
 
     @_lifecycle_operation
-    def cancel_run(self, run_id: str) -> dict[str, Any]:
-        run = self.store.get_run(run_id)
+    def cancel_run(
+        self, run_id: str, *, workspace_id: str | None = None
+    ) -> dict[str, Any]:
+        store = self._workspace_store(workspace_id)
+        run = store.get_run(run_id)
         with self._cancel_lock:
             signal = self._cancel_signals.get(run_id)
             if signal is not None:
                 signal.set()
         if run["execution_backend"] != "temporal":
-            cancelled = self.store.cancel_run(run_id)
+            cancelled = store.cancel_run(run_id)
             self._project_monitor_run(run_id)
             return cancelled
-        self.store.request_cancel_run(run_id)
+        store.request_cancel_run(run_id)
         try:
             dispatched = self.temporal.cancel(run_id)
         except Exception:
@@ -758,13 +1111,13 @@ class ControlPlaneService:
         if dispatched:
             return self._confirm_temporal_cancel(run_id)
         self._submit_background(self._retry_temporal_cancel, run_id)
-        return self.store.get_run(run_id, include_archived=True)
+        return store.get_run(run_id, include_archived=True)
 
     def _retry_temporal_cancel(self, run_id: str) -> None:
         delay = 0.25
         while not self._closing.is_set():
             try:
-                run = self.store.get_run(run_id, include_archived=True)
+                run = self.store.get_run_system(run_id, include_archived=True)
             except Exception:
                 return
             if run["state"] != "RUNNING" or run.get("cancel_requested_at") is None:
@@ -781,10 +1134,10 @@ class ControlPlaneService:
 
     def _confirm_temporal_cancel(self, run_id: str) -> dict[str, Any]:
         try:
-            cancelled = self.store.cancel_run(run_id)
+            cancelled = self.store.cancel_run_system(run_id)
             self._project_monitor_run(run_id)
         except ControlPlaneConflict:
-            return self.store.get_run(run_id, include_archived=True)
+            return self.store.get_run_system(run_id, include_archived=True)
         finally:
             with self._cancel_lock:
                 self._cancel_signals.pop(run_id, None)
@@ -823,6 +1176,7 @@ class ControlPlaneService:
                             api_key=api_key,
                             model=metadata["model"],
                             timeout_seconds=metadata["timeout_seconds"],
+                            max_output_tokens=metadata["max_output_tokens"],
                             stream=metadata["stream"],
                             probe_type=ProbeType(metadata["probe_type"]),
                             provider_id=metadata["provider_id"],
@@ -845,7 +1199,7 @@ class ControlPlaneService:
             result.run_id = run_id
             if cancel_signal.is_set():
                 return
-            current = self.store.get_run(run_id)
+            current = self.store.get_run_system(run_id)
             workflow = begin_component_evidence(
                 current["workflow"],
                 result=_component_result_view(result),
@@ -872,7 +1226,7 @@ class ControlPlaneService:
             self._project_monitor_run(run_id)
         except Exception:
             try:
-                current = self.store.get_run(run_id, include_archived=True)
+                current = self.store.get_run_system(run_id, include_archived=True)
             except Exception:
                 return
             if current["state"] == "CANCELLED":
@@ -886,7 +1240,7 @@ class ControlPlaneService:
                 self._cancel_signals.pop(run_id, None)
 
     def _mark_failed(self, run_id: str, code: str) -> None:
-        current = self.store.get_run(run_id, include_archived=True)
+        current = self.store.get_run_system(run_id, include_archived=True)
         if current["execution_backend"] == "temporal":
             workflow = _finalize_temporal_workflow(
                 current["workflow"], status="FAIL", failure_code=code
@@ -904,7 +1258,7 @@ class ControlPlaneService:
         self, run_id: str, events: Sequence[WorkflowEvent]
     ) -> None:
         for event in events:
-            current = self.store.get_run(run_id, include_archived=True)
+            current = self.store.get_run_system(run_id, include_archived=True)
             if current["state"] != "RUNNING":
                 return
             workflow = _apply_temporal_event(current["workflow"], event)
@@ -927,7 +1281,7 @@ class ControlPlaneService:
     ) -> None:
         try:
             try:
-                current = self.store.get_run(run_id, include_archived=True)
+                current = self.store.get_run_system(run_id, include_archived=True)
             except ControlPlaneNotFound:
                 return
             if current["state"] != "RUNNING":
@@ -969,7 +1323,7 @@ class ControlPlaneService:
     def _advance(
         self, run_id: str, step_id: str, status: ComponentStepStatus
     ) -> None:
-        current = self.store.get_run(run_id)
+        current = self.store.get_run_system(run_id)
         workflow = advance_component_run(
             current["workflow"], step_id, status, occurred_at=_now()
         )
@@ -1264,3 +1618,11 @@ def _reject_secret_in_durable_run_fields(
     for value in fields.values():
         if isinstance(value, str) and api_key in value:
             raise ValueError("api_key must not appear in a persisted run field")
+
+
+def _safe_batch_dispatch_failure(exc: BaseException) -> str:
+    if isinstance(exc, ValueError):
+        return "BATCH_CONFIGURATION_REJECTED"
+    if isinstance(exc, ControlPlaneConflict):
+        return "BATCH_STATE_CONFLICT"
+    return "BATCH_DISPATCH_ERROR"

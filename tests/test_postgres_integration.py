@@ -61,6 +61,11 @@ class PostgresIntegrationTests(unittest.TestCase):
             cls._psql_file("0004_agent_control_plane.sql")
             cls._psql_file("0005_continuous_monitoring.sql")
             cls._psql_file("0006_suite_secret_value_guard.sql")
+            cls._psql_file("0007_auth_workspaces.sql")
+            cls._psql_file("0008_credential_profiles.sql")
+            cls._psql_file("0009_partner_onboarding.sql")
+            cls._psql_file("0010_probe_batches.sql")
+            cls._psql_file("0011_evaluations.sql")
             from lexsond.storage.postgres import PostgresPool
 
             cls.pool = PostgresPool(cls.dsn, min_size=1, max_size=8)
@@ -221,6 +226,7 @@ class PostgresIntegrationTests(unittest.TestCase):
             raise unittest.SkipTest("web extra is unavailable") from exc
 
         from lexsond.web.app import create_app
+        from lexsond.web.auth import AuthConfiguration
         from lexsond.web.control_service import ControlPlaneService
         from lexsond.web.postgres_control_store import PostgresControlPlaneStore
 
@@ -235,6 +241,11 @@ class PostgresIntegrationTests(unittest.TestCase):
         app = create_app(
             service=service,
             frontend_path=self.root / "missing-frontend",
+            auth_configuration=AuthConfiguration.from_values(
+                auth_mode="local-single-user",
+                listen_host="127.0.0.1",
+                cookie_secure=False,
+            ),
         )
         secret = "sentinel-api-must-not-persist-123456"
         suffix = uuid4().hex[:10]
@@ -248,9 +259,13 @@ class PostgresIntegrationTests(unittest.TestCase):
         }
 
         with TestClient(app) as client:
-            created = client.post("/api/v1/targets", json=payload)
+            csrf = client.get("/api/v1/auth/session").json()["data"]["csrf_token"]
+            headers = {"X-CSRF-Token": csrf}
+            created = client.post("/api/v1/targets", json=payload, headers=headers)
             malformed = client.post(
-                "/api/v1/targets", json={**payload, "api_key": secret}
+                "/api/v1/targets",
+                json={**payload, "api_key": secret},
+                headers=headers,
             )
 
         self.assertEqual(created.status_code, 201)
@@ -258,8 +273,8 @@ class PostgresIntegrationTests(unittest.TestCase):
         self.assertNotIn(secret, malformed.text)
         target = created.json()["data"]
         self.assertNotIn(secret, json.dumps(target))
-        store.archive_target(target["id"])
-        store.purge_target(target["id"])
+        store.archive_target(target["id"], workspace_id=target["workspace_id"])
+        store.purge_target(target["id"], workspace_id=target["workspace_id"])
 
     def test_control_store_rejects_unsanitized_result_before_write(self) -> None:
         from lexsond.models import NormalizedRunResult, RequestMeasurement, RunStatus
@@ -322,6 +337,84 @@ class PostgresIntegrationTests(unittest.TestCase):
         store.purge_run(run_id)
         store.archive_target(target["id"])
         store.purge_target(target["id"])
+
+    def test_evaluation_datasets_are_immutable_scoped_and_purge_safe(self) -> None:
+        import psycopg
+
+        from lexsond.evaluations.compiler import compile_document_items
+        from lexsond.web.postgres_auth_store import PostgresAuthStore
+        from lexsond.web.postgres_evaluation_store import PostgresEvaluationStore
+
+        principal = PostgresAuthStore(self.pool).ensure_local_principal()
+        workspace_id = principal["workspace_id"]
+        actor_user_id = principal["user_id"]
+        store = PostgresEvaluationStore(self.pool)
+        store.ensure_system_catalog()
+        store.ensure_system_catalog()
+        catalog = store.list_datasets(workspace_id=workspace_id)
+        quickeval = next(value for value in catalog if value["slug"] == "lexsond-quickeval")
+        self.assertEqual(quickeval["latest_revision"]["item_count"], 80)
+
+        compiled = compile_document_items([{
+            "id": "workspace-item-001",
+            "category": "classification",
+            "language": "en",
+            "input": {"messages": [{"role": "user", "content": "Return only A."}]},
+            "reference": {"scorer": "exact_match", "answer": "A"},
+            "metadata": {"difficulty": "basic"},
+        }])
+        created = store.create_dataset(
+            {
+                "format": "jsonl",
+                "slug": f"workspace-eval-{uuid4().hex[:10]}",
+                "name": "Workspace evaluation fixture",
+                "description": "private deterministic fixture",
+                "license_spdx": "LicenseRef-Proprietary",
+                "license_url": "https://example.invalid/private-license",
+                "source_url": None,
+                "distribution_policy": "BUNDLED",
+                "default_scorer_id": "exact_match",
+            },
+            compiled,
+            workspace_id=workspace_id,
+            actor_user_id=actor_user_id,
+        )
+        revision_id = created["latest_revision"]["id"]
+        with self.assertRaises(psycopg.errors.ObjectNotInPrerequisiteState):
+            with self.pool.connection() as connection:
+                connection.execute(
+                    "UPDATE lexsond.evaluation_dataset_items SET category = 'changed' WHERE revision_id = %s",
+                    (revision_id,),
+                )
+        with self.assertRaises(psycopg.errors.ObjectNotInPrerequisiteState):
+            with self.pool.connection() as connection:
+                connection.execute(
+                    "SELECT set_config('lexsond.evaluation_purge', 'on', true)"
+                )
+                connection.execute(
+                    "DELETE FROM lexsond.evaluation_dataset_items WHERE revision_id = %s",
+                    (revision_id,),
+                )
+        with self.pool.connection() as connection:
+            privilege = connection.execute(
+                """
+                SELECT
+                    has_table_privilege(
+                        'lexsond_control', 'lexsond.evaluation_datasets', 'DELETE'
+                    ) AS control_can_delete,
+                    owner.rolsuper AS purge_owner_is_superuser
+                FROM pg_proc function
+                JOIN pg_roles owner ON owner.oid = function.proowner
+                WHERE function.oid =
+                    'lexsond.purge_evaluation_dataset(uuid,uuid)'::regprocedure
+                """
+            ).fetchone()
+        self.assertFalse(privilege["control_can_delete"])
+        self.assertFalse(privilege["purge_owner_is_superuser"])
+        store.archive_dataset(created["id"], workspace_id=workspace_id)
+        store.purge_dataset(created["id"], workspace_id=workspace_id)
+        with self.assertRaises(Exception):
+            store.get_dataset(created["id"], workspace_id=workspace_id, include_archived=True)
 
     def test_postgres_monitoring_claim_projection_and_retention(self) -> None:
         from datetime import UTC, datetime, timedelta
@@ -901,6 +994,16 @@ class PostgresIntegrationTests(unittest.TestCase):
             self._psql_file("0004_agent_control_plane.sql", database=database)
             self._psql_file("0005_continuous_monitoring.sql", database=database)
             self._psql_file("0006_suite_secret_value_guard.sql", database=database)
+            self._psql_file("0007_auth_workspaces.sql", database=database)
+            self._psql_file("0008_credential_profiles.sql", database=database)
+            self._psql_file("0009_partner_onboarding.sql", database=database)
+            self._psql_file("0010_probe_batches.sql", database=database)
+            self._psql_file("0011_evaluations.sql", database=database)
+            self._psql_file("0011_evaluations.down.sql", database=database)
+            self._psql_file("0010_probe_batches.down.sql", database=database)
+            self._psql_file("0009_partner_onboarding.down.sql", database=database)
+            self._psql_file("0008_credential_profiles.down.sql", database=database)
+            self._psql_file("0007_auth_workspaces.down.sql", database=database)
             self._psql_file(
                 "0006_suite_secret_value_guard.down.sql", database=database
             )

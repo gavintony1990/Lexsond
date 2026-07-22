@@ -287,6 +287,16 @@ class MockRelayHandler(BaseHTTPRequestHandler):
             self._json(404, _error("not_found", "Route not found"))
             return
         messages = request.get("messages") or []
+        if mode == "native_message_contract":
+            expected = [
+                {"role": "system", "content": "Follow the exact format."},
+                {"role": "user", "content": "Reply now."},
+                {"role": "assistant", "content": "Acknowledged."},
+                {"role": "user", "content": "Return PROBE_OK."},
+            ]
+            if messages != expected:
+                self._json(400, _error("schema_error", "message contract mismatch"))
+                return
         if messages and isinstance(messages[0], dict) and isinstance(messages[0].get("content"), list):
             self._json(
                 200,

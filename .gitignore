@@ -14,3 +14,4 @@ build/
 .DS_Store
 .idea/
 frontend/node_modules/
+output/

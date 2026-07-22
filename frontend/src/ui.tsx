@@ -2,7 +2,6 @@ import type { PropsWithChildren, ReactNode } from "react";
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
-  Activity,
   Archive,
   ArrowRight,
   BookOpen,
@@ -10,36 +9,56 @@ import {
   Database,
   FlaskConical,
   Gauge,
-  Grid3X3,
   Menu,
   Play,
   Radio,
   Server,
-  Target as TargetIcon,
   Waves,
   X,
+  ChevronDown,
+  LogOut,
+  UserCircle,
+  KeyRound,
+  ScanLine,
+  Layers3,
+  Handshake,
+  HeartPulse,
+  ShieldCheck,
+  UsersRound,
 } from "lucide-react";
 import { Link, NavLink, useLocation } from "react-router-dom";
 import { api, ApiError } from "./api";
 import type { ResultStatus, RunState } from "./types";
+import { useOptionalAuth } from "./auth";
 
 const navigation = [
-  { to: "/", label: "总览与入门", code: "00", icon: Gauge },
-  { to: "/targets", label: "添加 API 目标", code: "01", icon: TargetIcon },
-  { to: "/runs/new", label: "发起探测", code: "02", icon: Play },
-  { to: "/runs", label: "查看结果", code: "03", icon: Activity },
-  { to: "/monitoring", label: "持续监控", code: "04", icon: Grid3X3 },
-  { to: "/agent", label: "诊断助手", code: "05", icon: Bot },
-  { to: "/suites", label: "探测套件", code: "06", icon: FlaskConical },
+  { to: "/overview", label: "总览与入门", code: "01", icon: Gauge },
+  { to: "/api-keys/credentials", match: "/api-keys", label: "API Key 管理", code: "02", icon: KeyRound },
+  { to: "/probes/single", label: "单模型探测", code: "03", icon: ScanLine },
+  { to: "/probes/api-key", label: "API Key 模型探测", code: "04", icon: Layers3 },
+  { to: "/partners/onboarding", label: "合作中转站入驻", code: "05", icon: Handshake },
+  { to: "/partners/monitoring", label: "合作中转站持续监控", code: "06", icon: HeartPulse },
+  { to: "/assistant", label: "诊断助手 ChatGPT", code: "07", icon: Bot },
+  { to: "/suites", label: "探测套件管理", code: "08", icon: FlaskConical },
+];
+
+const apiKeyChildren = [
+  { to: "/api-keys/credentials", label: "密钥" },
+  { to: "/api-keys/channels", label: "渠道" },
+  { to: "/api-keys/vendors", label: "模型厂商" },
+  { to: "/api-keys/sources", label: "模型来源" },
 ];
 
 export function Shell({ children }: PropsWithChildren) {
   const [open, setOpen] = useState(false);
   const [guideOpen, setGuideOpen] = useState(false);
+  const [userOpen, setUserOpen] = useState(false);
+  const [apiKeysOpen, setApiKeysOpen] = useState(false);
+  const auth = useOptionalAuth();
   const location = useLocation();
   const bootstrap = useQuery({ queryKey: ["bootstrap"], queryFn: api.bootstrap });
   const current = navigation.find((item) =>
-    item.to === "/" ? location.pathname === "/" : location.pathname.startsWith(item.to),
+    location.pathname.startsWith(item.match ?? item.to),
   );
 
   return (
@@ -59,19 +78,19 @@ export function Shell({ children }: PropsWithChildren) {
             <X size={18} />
           </button>
         </div>
-        <div className="rail-caption">CONTROL DECK / 07</div>
+        <div className="rail-caption">CONTROL DECK / 08</div>
         <nav className="primary-nav" aria-label="主导航">
-          {navigation.map(({ to, label, code, icon: Icon }) => (
-            <NavLink
-              key={to}
-              to={to}
-              end={to === "/"}
-              onClick={() => setOpen(false)}
-              className={({ isActive }) => (isActive ? "active" : "")}
-            >
-              <Icon size={19} />
-              <span>{label}</span>
-              <em>{code}</em>
+          {navigation.map(({ to, match, label, code, icon: Icon }) => match === "/api-keys" ? (
+            <div className="nav-cluster" key={to}>
+              <div className="nav-parent">
+                <NavLink data-primary-nav-item to={to} onClick={() => setOpen(false)} className={location.pathname.startsWith(match) ? "active" : ""}><Icon size={19} /><span>{label}</span><em>{code}</em></NavLink>
+                <button type="button" aria-label={`${apiKeysOpen ? "收起" : "展开"}密钥管理子菜单`} aria-expanded={apiKeysOpen} onClick={() => setApiKeysOpen((value) => !value)}><ChevronDown size={14} /></button>
+              </div>
+              {apiKeysOpen && <div className="nav-children" role="navigation" aria-label="API Key 管理">{apiKeyChildren.map((child) => <NavLink key={child.to} to={child.to} onClick={() => setOpen(false)}>{child.label}</NavLink>)}</div>}
+            </div>
+          ) : (
+            <NavLink data-primary-nav-item key={to} to={to} onClick={() => setOpen(false)} className={location.pathname.startsWith(to) ? "active" : ""}>
+              <Icon size={19} /><span>{label}</span><em>{code}</em>
             </NavLink>
           ))}
         </nav>
@@ -102,6 +121,7 @@ export function Shell({ children }: PropsWithChildren) {
             <strong>{current?.label ?? "运行详情"}</strong>
           </div>
           <div className="top-status">
+            {auth?.session?.auth_mode === "local-single-user" && <span className="local-mode-badge">本地单用户模式</span>}
             <div className="signal-readout">
               <Radio size={15} />
               <span>LOCAL</span>
@@ -118,10 +138,25 @@ export function Shell({ children }: PropsWithChildren) {
               <BookOpen size={15} />
               <span>使用指南</span>
             </button>
-            <Link to="/runs/new" className="primary-action compact">
+            <Link to="/probes/single/new" className="primary-action compact">
               <Play size={15} fill="currentColor" />
               发起探测
             </Link>
+            {auth?.session && <div className="user-menu-wrap">
+              <button className="user-menu-trigger" aria-label="用户菜单" aria-expanded={userOpen} onClick={() => setUserOpen((value) => !value)}>
+                <span>{auth.session.user.display_name.slice(0, 1).toUpperCase()}</span>
+                <div><b>{auth.session.user.display_name}</b><small>{auth.session.user.workspace_name}</small></div>
+                <ChevronDown size={14} />
+              </button>
+              {userOpen && <div className="user-menu" role="menu">
+                <header><UserCircle size={17} /><p><b>{auth.session.user.display_name}</b><span>{auth.session.user.email}</span></p></header>
+                <div className="user-workspace"><span>当前工作区</span><b>{auth.session.user.workspace_name}</b><small>{auth.session.user.workspace_role}</small></div>
+                <Link role="menuitem" to="/settings/profile" onClick={() => setUserOpen(false)}><UserCircle size={15} />个人资料</Link>
+                <Link role="menuitem" to="/settings/workspace" onClick={() => setUserOpen(false)}><UsersRound size={15} />工作区</Link>
+                <Link role="menuitem" to="/settings/security" onClick={() => setUserOpen(false)}><ShieldCheck size={15} />会话设备</Link>
+                <button role="menuitem" onClick={() => void auth.logout()}><LogOut size={15} />退出登录</button>
+              </div>}
+            </div>}
           </div>
         </header>
         <div className="deck-content">{children}</div>

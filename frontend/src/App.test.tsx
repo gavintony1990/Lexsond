@@ -49,6 +49,23 @@ describe("observatory console", () => {
     expect(screen.getByRole("link", { name: /添加第一个目标/ })).toHaveAttribute("href", "/targets");
   });
 
+  it("keeps the eight product modules in the required order and exposes API Key children", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => new Response(JSON.stringify({ data: String(input).includes("/bootstrap") ? bootstrap : [] }), {
+      status: 200, headers: { "Content-Type": "application/json" },
+    })));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(<QueryClientProvider client={client}><MemoryRouter initialEntries={["/overview"]}><App /></MemoryRouter></QueryClientProvider>);
+
+    await screen.findByRole("heading", { name: "第一次探测，从这里开始" });
+    expect([...document.querySelectorAll("[data-primary-nav-item]")].map((element) => element.textContent?.trim())).toEqual([
+      "总览与入门01", "API Key 管理02", "单模型探测03", "API Key 模型探测04",
+      "合作中转站入驻05", "合作中转站持续监控06", "诊断助手 ChatGPT07", "探测套件管理08",
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "展开密钥管理子菜单" }));
+    const subnav = screen.getByRole("navigation", { name: "API Key 管理" });
+    expect(within(subnav).getAllByRole("link").map((link) => link.textContent)).toEqual(["密钥", "渠道", "模型厂商", "模型来源"]);
+  });
+
   it("opens a plain-language guide from the global navigation", async () => {
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);

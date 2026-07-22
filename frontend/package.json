@@ -7,6 +7,7 @@
     "dev": "vite",
     "generate:api": "../.venv/bin/python ../scripts/export_openapi.py --output openapi.json && openapi-typescript openapi.json -o src/generated/api-schema.ts",
     "build": "tsc -b && vite build",
+    "test:e2e": "playwright test",
     "test": "vitest run",
     "typecheck": "tsc -b --pretty false"
   },
@@ -28,6 +29,7 @@
     "@vitejs/plugin-react": "6.0.3",
     "jsdom": "29.1.1",
     "openapi-typescript": "7.13.0",
+    "playwright": "1.61.1",
     "typescript": "5.9.3",
     "vite": "8.1.5",
     "vitest": "4.1.10"

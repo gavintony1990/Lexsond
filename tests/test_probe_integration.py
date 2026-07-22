@@ -75,6 +75,29 @@ class ProbeIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(measurement.e2e_ms)
         self.assertGreaterEqual(measurement.chunk_count, 5)
 
+    def test_native_chat_messages_preserve_roles_order_and_redaction_boundary(self) -> None:
+        sensitive_prompt = "Return PROBE_OK."
+        config = ProbeConfig(
+            base_url=self.base_url,
+            api_key="test-key",
+            model="mock-model",
+            stream=False,
+            mock_mode="native_message_contract",
+            chat_messages=(
+                ("system", "Follow the exact format."),
+                ("user", "Reply now."),
+                ("assistant", "Acknowledged."),
+                ("user", sensitive_prompt),
+            ),
+        )
+        result = OpenAIChatProbe(config).run()
+
+        self.assertEqual(result.status, RunStatus.PASS)
+        self.assertNotIn(sensitive_prompt, repr(config))
+        serialized = json.dumps(result.to_dict())
+        self.assertNotIn(sensitive_prompt, serialized)
+        self.assertNotIn("test-key", serialized)
+
     def test_dynamic_expected_text_detects_fixed_or_replayed_output(self) -> None:
         matching = OpenAIChatProbe(
             ProbeConfig(
@@ -273,6 +296,7 @@ class ProbeIntegrationTests(unittest.TestCase):
         result = self.run_probe(mode="rate_limit")
         self.assertEqual(result.status, RunStatus.FAIL)
         self.assertEqual(result.measurements[0].error_class, ErrorClass.RATE_LIMIT)
+        self.assertEqual(result.measurements[0].evidence["retry_after_seconds"], 1.0)
 
     def test_insufficient_balance_is_classified_without_error_body(self) -> None:
         result = self.run_probe(mode="payment_required")

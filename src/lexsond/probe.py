@@ -14,6 +14,8 @@ import time
 import wave
 import zlib
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -102,6 +104,9 @@ class ProbeConfig:
     timeout_seconds: float = 30.0
     stream: bool = True
     prompt: str = "Reply with exactly: PROBE_OK"
+    chat_messages: tuple[tuple[str, str], ...] | None = field(
+        default=None, repr=False
+    )
     max_output_tokens: int = 64
     mock_mode: str | None = None
     probe_type: ProbeType = ProbeType.CHAT
@@ -120,6 +125,23 @@ class ProbeConfig:
             raise ValueError("model must not contain api_key")
         if self.api_key is not None and self.api_key in self.prompt:
             raise ValueError("prompt must not contain api_key")
+        if self.chat_messages is not None:
+            if self.probe_type != ProbeType.CHAT:
+                raise ValueError("chat_messages are supported only by the chat probe")
+            if not 1 <= len(self.chat_messages) <= 16:
+                raise ValueError("chat_messages must contain 1 to 16 messages")
+            for message in self.chat_messages:
+                if (
+                    not isinstance(message, tuple)
+                    or len(message) != 2
+                    or message[0] not in {"system", "user", "assistant"}
+                    or not isinstance(message[1], str)
+                    or not message[1]
+                    or len(message[1]) > 32 * 1024
+                ):
+                    raise ValueError("chat_messages contain an invalid message")
+                if self.api_key is not None and self.api_key in message[1]:
+                    raise ValueError("chat_messages must not contain api_key")
         if self.provider_id is not None and (
             not isinstance(self.provider_id, str)
             or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", self.provider_id)
@@ -405,6 +427,14 @@ class OpenAIChatProbe:
                     "image_url": {"url": _red_probe_image_data_url(), "detail": "low"},
                 },
             ]
+        messages = (
+            [
+                {"role": role, "content": message_content}
+                for role, message_content in self.config.chat_messages
+            ]
+            if self.config.chat_messages is not None
+            else [{"role": "user", "content": content}]
+        )
         payload = json.dumps(
             {
                 "model": self.config.model,
@@ -412,7 +442,7 @@ class OpenAIChatProbe:
                 "stream_options": {"include_usage": True},
                 "temperature": 0,
                 "max_tokens": self.config.max_output_tokens,
-                "messages": [{"role": "user", "content": content}],
+                "messages": messages,
             }
         ).encode("utf-8")
         headers = {
@@ -455,6 +485,7 @@ class OpenAIChatProbe:
                 self.progress.measured_elapsed_ns(started_ns, headers_ns)
             )
             measurement.status_code = response.status
+            _capture_retry_after(response, measurement)
 
             if response.status != 200:
                 body = _read_bounded_response(
@@ -894,6 +925,7 @@ class OpenAIEndpointProbe:
                 self.progress.measured_elapsed_ns(started_ns)
             )
             measurement.status_code = response.status
+            _capture_retry_after(response, measurement)
             if response.status != 200:
                 error_body = _read_bounded_response(
                     response,
@@ -1250,6 +1282,30 @@ def _json_object(body: bytes) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("response body must be a JSON object")
     return payload
+
+
+def _capture_retry_after(
+    response: http.client.HTTPResponse,
+    measurement: RequestMeasurement,
+) -> None:
+    """Retain bounded capacity evidence without retaining an arbitrary header."""
+
+    raw = response.getheader("Retry-After")
+    if raw is None or len(raw) > 128:
+        return
+    seconds: float | None = None
+    try:
+        seconds = float(raw.strip())
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(raw)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            seconds = max((retry_at - datetime.now(UTC)).total_seconds(), 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return
+    if math.isfinite(seconds) and 0 <= seconds <= 86_400:
+        measurement.evidence["retry_after_seconds"] = round(seconds, 3)
 
 
 def _set_connection_deadline_timeout(

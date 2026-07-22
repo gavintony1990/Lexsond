@@ -14,6 +14,8 @@ dependencies = []
 
 [project.optional-dependencies]
 web = [
+  "argon2-cffi==25.1.0",
+  "keyring==25.7.0",
   "fastapi==0.139.2",
   "httpx==0.28.1",
   "langchain-core==1.4.9",
@@ -28,6 +30,8 @@ postgres = [
   "psycopg-pool==3.3.1",
 ]
 production = [
+  "argon2-cffi==25.1.0",
+  "keyring==25.7.0",
   "fastapi==0.139.2",
   "httpx==0.28.1",
   "langchain-core==1.4.9",

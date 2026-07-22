@@ -296,6 +296,12 @@ class PersistenceLifecycleTests(unittest.TestCase):
                     "cancel_requested_at": "2026-07-22T00:00:00+00:00",
                 }
 
+            def get_run_system(self, run_id, **kwargs):
+                return self.get_run(run_id, **kwargs)
+
+            def cancel_run_system(self, _run_id):
+                return None
+
         class Temporal:
             available = True
             status = "READY"
@@ -399,6 +405,12 @@ class _LifecycleStore:
     def record_monitor_run(self, _run_id):
         return None
 
+    def get_run_system(self, run_id, **kwargs):
+        return self.get_run(run_id, **kwargs)
+
+    def cancel_run_system(self, run_id):
+        return self.cancel_run(run_id)
+
 
 def _import_control_service_without_optional_dependencies():
     agent = types.ModuleType("lexsond.agent.service")
@@ -412,6 +424,9 @@ def _import_control_service_without_optional_dependencies():
     for name in (
         "MonitorPolicyCreate",
         "MonitorPolicyPatch",
+        "PartnerApplicationCreate",
+        "PartnerApplicationPatch",
+        "ProbeBatchCreate",
         "RunCreate",
         "SuiteCreate",
         "SuitePatch",
